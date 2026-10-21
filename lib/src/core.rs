@@ -485,9 +485,7 @@ impl Core {
         peer_ip: std::net::IpAddr,
         client_id: &log_utils::IdChain<u64>,
     ) -> Result<tls_demultiplexer::ConnectionMeta, String> {
-        let sni = acceptor
-            .sni()
-            .ok_or_else(|| "Drop TLS connection due to absence of SNI".to_owned())?;
+        let sni = acceptor.sni().unwrap_or_default();
         log_id!(
             trace,
             client_id,

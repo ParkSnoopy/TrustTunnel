@@ -22,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- [Fix] TLS connections with missing or unknown SNI can use the only main host when reverse proxy is enabled, retaining native authentication.
+
 ### Security
 
 ## [1.3.0-beta.2] - 2026-10-09

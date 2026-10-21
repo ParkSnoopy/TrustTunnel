@@ -105,6 +105,7 @@ pub struct TlsDemux {
     speedtest_hosts: HashMap<String, Host>,
     tunnel_protocols: SmallVec<[Protocol; 3]>,
     allowed_sni_to_main_host: HashMap<String, String>,
+    default_host: Option<String>,
 }
 
 impl Protocol {
@@ -182,6 +183,15 @@ impl TlsDemux {
                 x
             },
             allowed_sni_to_main_host,
+            default_host: if settings.reverse_proxy.is_some() && tls_settings.main_hosts.len() == 1
+            {
+                tls_settings
+                    .main_hosts
+                    .first()
+                    .map(|host| host.hostname.clone())
+            } else {
+                None
+            },
         })
     }
 }
@@ -338,7 +348,11 @@ impl TlsDemux {
                 host,
                 Some(String::from(auth_creds)),
             )
-        } else if let Some(main_hostname) = self.allowed_sni_to_main_host.get(&sni) {
+        } else if let Some(main_hostname) = self
+            .allowed_sni_to_main_host
+            .get(&sni)
+            .or(self.default_host.as_ref())
+        {
             let host = self
                 .main_hosts
                 .get(main_hostname)
@@ -661,6 +675,49 @@ mod tests {
             return Err(format!("Selected {:?}, expected HTTP3", meta.protocol).into());
         }
         Ok(())
+    }
+
+    #[test]
+    fn camouflage_default_host_keeps_native_auth_channel() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut settings = Settings::default();
+        settings.reverse_proxy = Some(dummy_reverse_proxy_settings());
+        let mut hosts = TlsHostsSettings::default();
+        hosts.main_hosts = vec![make_tls_host("camouflage.example".to_string())];
+        let demux = TlsDemux::new(&settings, &hosts)?;
+        for sni in ["", "unknown.example"] {
+            for protocol in [Protocol::Http1, Protocol::Http2] {
+                let meta = demux.select(
+                    std::iter::once(protocol.as_alpn().as_bytes()),
+                    sni.to_string(),
+                )?;
+                crate::utils::check(
+                    meta.channel == Channel::Tunnel,
+                    "camouflage channel changed",
+                )?;
+                crate::utils::check(meta.protocol == protocol, "camouflage protocol changed")?;
+                crate::utils::check(
+                    meta.sni_auth_creds.is_none(),
+                    "camouflage fallback unexpectedly authenticated",
+                )?;
+            }
+        }
+        settings.reverse_proxy = None;
+        let demux = TlsDemux::new(&settings, &hosts)?;
+        crate::utils::check(
+            demux.select(std::iter::empty(), String::new()).is_err(),
+            "camouflage fallback enabled without a reverse proxy",
+        )?;
+        settings.reverse_proxy = Some(dummy_reverse_proxy_settings());
+        hosts
+            .main_hosts
+            .push(make_tls_host("second.example".to_string()));
+        let demux = TlsDemux::new(&settings, &hosts)?;
+        crate::utils::check(
+            demux.select(std::iter::empty(), String::new()).is_err(),
+            "camouflage fallback enabled with multiple main hosts",
+        )
+        .map_err(Into::into)
     }
 
     #[test]
