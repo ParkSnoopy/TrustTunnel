@@ -1,13 +1,17 @@
+//! Connection filtering and authenticated TLS client-random validation.
+
 use ipnet::IpNet;
 use ring::hkdf::KeyType;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 /// Action to take when a rule matches
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleAction {
+    /// Accept a matching connection.
     Allow,
+    /// Reject a matching connection.
     Deny,
 }
 
@@ -20,14 +24,14 @@ pub struct Rule {
 
     /// Client random prefix to match (hex-encoded)
     /// Can optionally include a mask in format: "prefix[/mask]" (e.g., "aabbcc/ff00ff")
-    /// If mask is specified, matching uses: client_random & mask == prefix & mask
+    /// If mask is specified, matching uses: `client_random` & mask == prefix & mask
     /// If no mask, uses prefix matching
     #[serde(default)]
     pub client_random_prefix: Option<String>,
 
-    /// auth key (hex) for client_random validation via HKDF+AES.
-    /// When set, matches() validates the full 32-byte client_random against the SNI.
-    /// Mutually exclusive with client_random_prefix (the auth key takes priority).
+    /// auth key (hex) for `client_random` validation via HKDF+AES.
+    /// When set, `matches()` validates the full 32-byte `client_random` against the SNI.
+    /// Mutually exclusive with `client_random_prefix` (the auth key takes priority).
     #[serde(default)]
     pub client_random_auth_key: Option<String>,
 
@@ -48,10 +52,20 @@ pub struct RulesEngine {
     rules: RulesConfig,
 }
 
+impl std::fmt::Debug for RulesEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RulesEngine")
+            .field("rules", &self.rules.rule.len())
+            .finish()
+    }
+}
+
 /// Result of rule evaluation
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleEvaluation {
+    /// The connection is allowed.
     Allow,
+    /// The connection is denied.
     Deny,
 }
 
@@ -65,6 +79,7 @@ impl KeyType for Aes128KeyLen {
 }
 
 /// Check if a string is valid even-length hex.
+#[must_use]
 pub fn is_valid_hex(s: &str) -> bool {
     !s.is_empty() && s.len().is_multiple_of(2) && hex::decode(s).is_ok()
 }
@@ -72,8 +87,9 @@ pub fn is_valid_hex(s: &str) -> bool {
 /// Validate a 32-byte `client_random` against `sni` using an auth-key-derived key.
 ///
 /// The second 16 bytes of `client_random` must equal
-/// AES-128-ECB(SHA256(SNI)[..16], HKDF-SHA256(auth_key, salt = random[..16],
-/// info = "tls13 encryption context")).
+/// `AES-128-ECB(SHA256(SNI)[..16], HKDF-SHA256(auth_key, salt = random[..16],`
+/// `info = "tls13 encryption context"))`.
+#[must_use]
 pub fn validate_client_random_auth_key(auth_key: &[u8], client_random: &[u8], sni: &str) -> bool {
     if client_random.len() != 32 || sni.is_empty() || auth_key.is_empty() {
         return false;
@@ -84,9 +100,8 @@ pub fn validate_client_random_auth_key(auth_key: &[u8], client_random: &[u8], sn
     let info: [&[u8]; 1] = [b"tls13 encryption context"];
     let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, random);
     let prk = salt.extract(auth_key);
-    let okm = match prk.expand(&info, Aes128KeyLen) {
-        Ok(okm) => okm,
-        Err(_) => return false,
+    let Ok(okm) = prk.expand(&info, Aes128KeyLen) else {
+        return false;
     };
     let mut derived_key = [0u8; 16];
     if okm.fill(&mut derived_key).is_err() {
@@ -97,21 +112,19 @@ pub fn validate_client_random_auth_key(auth_key: &[u8], client_random: &[u8], sn
     let sni_hash_prefix = &sni_hash.as_ref()[..16];
 
     // AES-128-ECB encrypt of the first 16 bytes of SHA256(SNI), no padding
-    let mut crypter = match boring::symm::Crypter::new(
+    let Ok(mut crypter) = boring::symm::Crypter::new(
         boring::symm::Cipher::aes_128_ecb(),
         boring::symm::Mode::Encrypt,
         &derived_key,
         None,
-    ) {
-        Ok(c) => c,
-        Err(_) => return false,
+    ) else {
+        return false;
     };
     crypter.pad(false);
     // output buffer must be at least input.len() + block_size() = 32
     let mut buf = [0u8; 32];
-    let n = match crypter.update(sni_hash_prefix, &mut buf) {
-        Ok(n) => n,
-        Err(_) => return false,
+    let Ok(n) = crypter.update(sni_hash_prefix, &mut buf) else {
+        return false;
     };
     if crypter.finalize(&mut buf[n..]).is_err() {
         return false;
@@ -120,14 +133,15 @@ pub fn validate_client_random_auth_key(auth_key: &[u8], client_random: &[u8], sn
 
     // Constant-time comparison to avoid timing side channels
     let mut diff = 0u8;
-    for i in 0..expected.len() {
-        diff |= ciphertext[i] ^ expected[i];
+    for (actual, expected) in ciphertext.iter().zip(expected) {
+        diff |= actual ^ expected;
     }
     diff == 0
 }
 
 impl Rule {
     /// Check if this rule matches the given connection parameters
+    #[must_use]
     pub fn matches(
         &self,
         client_ip: &IpAddr,
@@ -221,12 +235,14 @@ impl Rule {
 
 impl RulesEngine {
     /// Create a new rules engine from rules config
-    pub fn from_config(rules: RulesConfig) -> Self {
+    #[must_use]
+    pub const fn from_config(rules: RulesConfig) -> Self {
         Self { rules }
     }
 
     /// Create a default rules engine that allows all connections
-    pub fn default_allow() -> Self {
+    #[must_use]
+    pub const fn default_allow() -> Self {
         Self {
             rules: RulesConfig { rule: vec![] },
         }
@@ -234,6 +250,7 @@ impl RulesEngine {
 
     /// Evaluate connection against all rules
     /// Returns the action from the first matching rule, or Allow if no rules match
+    #[must_use]
     pub fn evaluate(
         &self,
         client_ip: &IpAddr,
@@ -251,7 +268,7 @@ impl RulesEngine {
             .iter()
             .any(|r| r.client_random_auth_key.is_some());
 
-        let sni_is_missing = sni.is_none_or(|s| s.is_empty());
+        let sni_is_missing = sni.is_none_or(str::is_empty);
 
         if (client_random.is_none() && (has_prefix_rule || has_auth_key_rule))
             || (sni_is_missing && has_auth_key_rule)
@@ -273,7 +290,8 @@ impl RulesEngine {
     }
 
     /// Get a reference to the rules configuration
-    pub fn config(&self) -> &RulesConfig {
+    #[must_use]
+    pub const fn config(&self) -> &RulesConfig {
         &self.rules
     }
 }
@@ -283,16 +301,22 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    /// Derive a deterministic 32-byte client_random for an auth key and SNI, mirroring
-    /// the algorithm verified by validate_client_random_auth_key.
-    fn derive_client_random(auth_key: &[u8], sni: &str) -> Vec<u8> {
+    /// Derive a deterministic 32-byte `client_random` for an auth key and SNI, mirroring
+    /// the algorithm verified by `validate_client_random_auth_key`.
+    fn derive_client_random(
+        auth_key: &[u8],
+        sni: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let random = [0x11u8; 16];
         let info: [&[u8]; 1] = [b"tls13 encryption context"];
         let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &random);
         let prk = salt.extract(auth_key);
-        let okm = prk.expand(&info, Aes128KeyLen).unwrap();
+        let okm = prk
+            .expand(&info, Aes128KeyLen)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let mut derived_key = [0u8; 16];
-        okm.fill(&mut derived_key).unwrap();
+        okm.fill(&mut derived_key)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
 
         let sni_hash = ring::digest::digest(&ring::digest::SHA256, sni.as_bytes());
         let mut crypter = boring::symm::Crypter::new(
@@ -300,21 +324,20 @@ mod tests {
             boring::symm::Mode::Encrypt,
             &derived_key,
             None,
-        )
-        .unwrap();
+        )?;
         crypter.pad(false);
         let mut buf = [0u8; 32];
-        let n = crypter.update(&sni_hash.as_ref()[..16], &mut buf).unwrap();
-        crypter.finalize(&mut buf[n..]).unwrap();
+        let n = crypter.update(&sni_hash.as_ref()[..16], &mut buf)?;
+        crypter.finalize(&mut buf[n..])?;
 
         let mut client_random = Vec::with_capacity(32);
         client_random.extend_from_slice(&random);
         client_random.extend_from_slice(&buf[..16]);
-        client_random
+        Ok(client_random)
     }
 
     #[test]
-    fn test_cidr_rule_matching() {
+    fn test_cidr_rule_matching() -> Result<(), Box<dyn std::error::Error>> {
         let rule = Rule {
             cidr: Some("192.168.1.0/24".to_string()),
             client_random_prefix: None,
@@ -322,15 +345,28 @@ mod tests {
             action: RuleAction::Allow,
         };
 
-        let ip_match = IpAddr::from_str("192.168.1.100").unwrap();
-        let ip_no_match = IpAddr::from_str("10.0.0.1").unwrap();
+        let ip_match = IpAddr::from_str("192.168.1.100")?;
+        let ip_no_match = IpAddr::from_str("10.0.0.1")?;
 
-        assert!(rule.matches(&ip_match, None, None));
-        assert!(!rule.matches(&ip_no_match, None, None));
+        if !(rule.matches(&ip_match, None, None)) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(rule.matches(&ip_match, None, None))
+            )
+            .into());
+        }
+        if rule.matches(&ip_no_match, None, None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip_no_match, None, None))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_client_random_prefix_matching() {
+    fn test_client_random_prefix_matching() -> Result<(), Box<dyn std::error::Error>> {
         let rule = Rule {
             cidr: None,
             client_random_prefix: Some("aabbcc".to_string()),
@@ -338,18 +374,37 @@ mod tests {
             action: RuleAction::Deny,
         };
 
-        let client_random_match = hex::decode("aabbccddee").unwrap();
-        let client_random_no_match = hex::decode("112233").unwrap();
+        let client_random_match = hex::decode("aabbccddee")?;
+        let client_random_no_match = hex::decode("112233")?;
 
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
 
-        assert!(rule.matches(&ip, Some(&client_random_match), None));
-        assert!(!rule.matches(&ip, Some(&client_random_no_match), None));
-        assert!(!rule.matches(&ip, None, None)); // No client random provided
+        if !(rule.matches(&ip, Some(&client_random_match), None)) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(rule.matches(&ip, Some(&client_random_match), None))
+            )
+            .into());
+        }
+        if rule.matches(&ip, Some(&client_random_no_match), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip, Some(&client_random_no_match), None))
+            )
+            .into());
+        }
+        if rule.matches(&ip, None, None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip, None, None))
+            )
+            .into());
+        } // No client random provided
+        Ok(())
     }
 
     #[test]
-    fn test_combined_rule_matching() {
+    fn test_combined_rule_matching() -> Result<(), Box<dyn std::error::Error>> {
         let rule = Rule {
             cidr: Some("10.0.0.0/8".to_string()),
             client_random_prefix: Some("ff".to_string()),
@@ -357,20 +412,45 @@ mod tests {
             action: RuleAction::Allow,
         };
 
-        let ip_match = IpAddr::from_str("10.1.2.3").unwrap();
-        let ip_no_match = IpAddr::from_str("192.168.1.1").unwrap();
-        let client_random_match = hex::decode("ff00112233").unwrap();
-        let client_random_no_match = hex::decode("0011223344").unwrap();
+        let ip_match = IpAddr::from_str("10.1.2.3")?;
+        let ip_no_match = IpAddr::from_str("192.168.1.1")?;
+        let client_random_match = hex::decode("ff00112233")?;
+        let client_random_no_match = hex::decode("0011223344")?;
 
         // Both must match
-        assert!(rule.matches(&ip_match, Some(&client_random_match), None));
-        assert!(!rule.matches(&ip_match, Some(&client_random_no_match), None));
-        assert!(!rule.matches(&ip_no_match, Some(&client_random_match), None));
-        assert!(!rule.matches(&ip_no_match, Some(&client_random_no_match), None));
+        if !(rule.matches(&ip_match, Some(&client_random_match), None)) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(rule.matches(&ip_match, Some(&client_random_match), None))
+            )
+            .into());
+        }
+        if rule.matches(&ip_match, Some(&client_random_no_match), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip_match, Some(&client_random_no_match), None))
+            )
+            .into());
+        }
+        if rule.matches(&ip_no_match, Some(&client_random_match), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip_no_match, Some(&client_random_match), None))
+            )
+            .into());
+        }
+        if rule.matches(&ip_no_match, Some(&client_random_no_match), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip_no_match, Some(&client_random_no_match), None))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_rules_engine_evaluation() {
+    fn test_rules_engine_evaluation() -> Result<(), Box<dyn std::error::Error>> {
         let rules = RulesConfig {
             rule: vec![
                 Rule {
@@ -396,23 +476,49 @@ mod tests {
 
         let engine = RulesEngine::from_config(rules);
 
-        let ip_deny = IpAddr::from_str("192.168.1.100").unwrap();
-        let ip_allow = IpAddr::from_str("10.1.2.3").unwrap();
-        let ip_default = IpAddr::from_str("172.16.1.1").unwrap();
+        let ip_deny = IpAddr::from_str("192.168.1.100")?;
+        let ip_allow = IpAddr::from_str("10.1.2.3")?;
+        let ip_default = IpAddr::from_str("172.16.1.1")?;
 
-        assert_eq!(engine.evaluate(&ip_deny, None, None), RuleEvaluation::Deny);
-        assert_eq!(
-            engine.evaluate(&ip_allow, None, None),
-            RuleEvaluation::Allow
+        let (actual, expected) = (
+            &(engine.evaluate(&ip_deny, None, None)),
+            &(RuleEvaluation::Deny),
         );
-        assert_eq!(
-            engine.evaluate(&ip_default, None, None),
-            RuleEvaluation::Deny
-        ); // Default deny
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        let (actual, expected) = (
+            &(engine.evaluate(&ip_allow, None, None)),
+            &(RuleEvaluation::Allow),
+        );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        let (actual, expected) = (
+            &(engine.evaluate(&ip_default, None, None)),
+            &(RuleEvaluation::Deny),
+        );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        } // Default deny
+        Ok(())
     }
 
     #[test]
-    fn test_rules_engine_fails_closed_without_client_random() {
+    fn test_rules_engine_fails_closed_without_client_random(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let rules = RulesConfig {
             rule: vec![Rule {
                 cidr: None,
@@ -423,13 +529,21 @@ mod tests {
         };
 
         let engine = RulesEngine::from_config(rules);
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
 
-        assert_eq!(engine.evaluate(&ip, None, None), RuleEvaluation::Deny);
+        let (actual, expected) = (&(engine.evaluate(&ip, None, None)), &(RuleEvaluation::Deny));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_client_random_mask_matching() {
+    fn test_client_random_mask_matching() -> Result<(), Box<dyn std::error::Error>> {
         // Test mask matching: only check specific bits
         // Format: "prefix/mask" where mask 0xf0f0 means we only care about bits in positions where mask is 1
         let rule = Rule {
@@ -439,25 +553,50 @@ mod tests {
             action: RuleAction::Allow,
         };
 
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
 
         // Should match: a5b5 & f0f0 = a0b0, same as prefix & mask
-        let client_random_match1 = hex::decode("a5b5ccdd").unwrap(); // 10100101 10110101
-                                                                     // Should match: a9bf & f0f0 = a0b0, same as prefix & mask
-        let client_random_match2 = hex::decode("a9bfeeaa").unwrap(); // 10101001 10111111
-                                                                     // Should not match: b0b0 & f0f0 = b0b0, different from a0b0
-        let client_random_no_match1 = hex::decode("b0b01122").unwrap(); // 10110000 10110000
-                                                                        // Should not match: a0c0 & f0f0 = a0c0, different from a0b0
-        let client_random_no_match2 = hex::decode("a0c03344").unwrap(); // 10100000 11000000
+        let client_random_match1 = hex::decode("a5b5ccdd")?; // 10100101 10110101
+                                                             // Should match: a9bf & f0f0 = a0b0, same as prefix & mask
+        let client_random_match2 = hex::decode("a9bfeeaa")?; // 10101001 10111111
+                                                             // Should not match: b0b0 & f0f0 = b0b0, different from a0b0
+        let client_random_no_match1 = hex::decode("b0b01122")?; // 10110000 10110000
+                                                                // Should not match: a0c0 & f0f0 = a0c0, different from a0b0
+        let client_random_no_match2 = hex::decode("a0c03344")?; // 10100000 11000000
 
-        assert!(rule.matches(&ip, Some(&client_random_match1), None));
-        assert!(rule.matches(&ip, Some(&client_random_match2), None));
-        assert!(!rule.matches(&ip, Some(&client_random_no_match1), None));
-        assert!(!rule.matches(&ip, Some(&client_random_no_match2), None));
+        if !(rule.matches(&ip, Some(&client_random_match1), None)) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(rule.matches(&ip, Some(&client_random_match1), None))
+            )
+            .into());
+        }
+        if !(rule.matches(&ip, Some(&client_random_match2), None)) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(rule.matches(&ip, Some(&client_random_match2), None))
+            )
+            .into());
+        }
+        if rule.matches(&ip, Some(&client_random_no_match1), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip, Some(&client_random_no_match1), None))
+            )
+            .into());
+        }
+        if rule.matches(&ip, Some(&client_random_no_match2), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip, Some(&client_random_no_match2), None))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_client_random_mask_full_bytes() {
+    fn test_client_random_mask_full_bytes() -> Result<(), Box<dyn std::error::Error>> {
         // Test with full byte mask - only first 2 bytes matter
         let rule = Rule {
             cidr: None,
@@ -466,19 +605,32 @@ mod tests {
             action: RuleAction::Allow,
         };
 
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
 
         // Should match: first 2 bytes are 0x1234, last 2 can be anything
-        let client_random_match = hex::decode("1234aaaabbbb").unwrap();
+        let client_random_match = hex::decode("1234aaaabbbb")?;
         // Should not match: first 2 bytes are 0x1233
-        let client_random_no_match = hex::decode("12335678ccdd").unwrap();
+        let client_random_no_match = hex::decode("12335678ccdd")?;
 
-        assert!(rule.matches(&ip, Some(&client_random_match), None));
-        assert!(!rule.matches(&ip, Some(&client_random_no_match), None));
+        if !(rule.matches(&ip, Some(&client_random_match), None)) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(rule.matches(&ip, Some(&client_random_match), None))
+            )
+            .into());
+        }
+        if rule.matches(&ip, Some(&client_random_no_match), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip, Some(&client_random_no_match), None))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_client_random_invalid_mask_format() {
+    fn test_client_random_invalid_mask_format() -> Result<(), Box<dyn std::error::Error>> {
         // Test that invalid format "prefix/" (slash without mask) doesn't match
         let rule = Rule {
             cidr: None,
@@ -487,94 +639,144 @@ mod tests {
             action: RuleAction::Allow,
         };
 
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
-        let client_random = hex::decode("aabbccddee").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
+        let client_random = hex::decode("aabbccddee")?;
 
         // Should not match due to invalid format
-        assert!(!rule.matches(&ip, Some(&client_random), None));
+        if rule.matches(&ip, Some(&client_random), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip, Some(&client_random), None))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_validation_accepts_derived_client_random() {
-        let auth_key = hex::decode("aabbccddeeff00112233445566778899").unwrap();
-        let client_random = derive_client_random(&auth_key, "test.example.com");
+    fn test_auth_key_validation_accepts_derived_client_random(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let auth_key = hex::decode("aabbccddeeff00112233445566778899")?;
+        let client_random = derive_client_random(&auth_key, "test.example.com")?;
 
-        assert!(validate_client_random_auth_key(
-            &auth_key,
-            &client_random,
-            "test.example.com"
-        ));
+        if !(validate_client_random_auth_key(&auth_key, &client_random, "test.example.com")) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(validate_client_random_auth_key(
+                    &auth_key,
+                    &client_random,
+                    "test.example.com"
+                ))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_validation_hardcoded_vector_abcd() {
-        let auth_key = hex::decode("aabbccddeeff00112233445566778899").unwrap();
+    fn test_auth_key_validation_hardcoded_vector_abcd() -> Result<(), Box<dyn std::error::Error>> {
+        let auth_key = hex::decode("aabbccddeeff00112233445566778899")?;
         let client_random =
-            hex::decode("112233445566778899001122334455669591807266c901dfe8c73c3040b1bd82")
-                .unwrap();
+            hex::decode("112233445566778899001122334455669591807266c901dfe8c73c3040b1bd82")?;
 
-        assert!(validate_client_random_auth_key(
-            &auth_key,
-            &client_random,
-            "abcd"
-        ));
+        if !(validate_client_random_auth_key(&auth_key, &client_random, "abcd")) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(validate_client_random_auth_key(
+                    &auth_key,
+                    &client_random,
+                    "abcd"
+                ))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_validation_hardcoded_vector_word_tips() {
-        let auth_key = hex::decode("00112233445566778899aabbccddeeff").unwrap();
+    fn test_auth_key_validation_hardcoded_vector_word_tips(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let auth_key = hex::decode("00112233445566778899aabbccddeeff")?;
         let client_random =
-            hex::decode("ffeeddccbbaa998877665544332211001fdc0ae97cd36d557dd426c34566e234")
-                .unwrap();
+            hex::decode("ffeeddccbbaa998877665544332211001fdc0ae97cd36d557dd426c34566e234")?;
 
-        assert!(validate_client_random_auth_key(
-            &auth_key,
-            &client_random,
-            "word.tips"
-        ));
+        if !(validate_client_random_auth_key(&auth_key, &client_random, "word.tips")) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(validate_client_random_auth_key(
+                    &auth_key,
+                    &client_random,
+                    "word.tips"
+                ))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_validation_wrong_sni() {
-        let auth_key = hex::decode("aabbccddeeff00112233445566778899").unwrap();
-        let client_random = derive_client_random(&auth_key, "a.example.com");
+    fn test_auth_key_validation_wrong_sni() -> Result<(), Box<dyn std::error::Error>> {
+        let auth_key = hex::decode("aabbccddeeff00112233445566778899")?;
+        let client_random = derive_client_random(&auth_key, "a.example.com")?;
 
-        assert!(!validate_client_random_auth_key(
-            &auth_key,
-            &client_random,
-            "b.example.com"
-        ));
+        if validate_client_random_auth_key(&auth_key, &client_random, "b.example.com") {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!validate_client_random_auth_key(
+                    &auth_key,
+                    &client_random,
+                    "b.example.com"
+                ))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_validation_wrong_auth_key() {
-        let auth_key1 = hex::decode("aabbccddeeff00112233445566778899").unwrap();
-        let auth_key2 = hex::decode("00112233445566778899aabbccddeeff").unwrap();
-        let client_random = derive_client_random(&auth_key1, "test.example.com");
+    fn test_auth_key_validation_wrong_auth_key() -> Result<(), Box<dyn std::error::Error>> {
+        let auth_key1 = hex::decode("aabbccddeeff00112233445566778899")?;
+        let auth_key2 = hex::decode("00112233445566778899aabbccddeeff")?;
+        let client_random = derive_client_random(&auth_key1, "test.example.com")?;
 
-        assert!(!validate_client_random_auth_key(
-            &auth_key2,
-            &client_random,
-            "test.example.com"
-        ));
+        if validate_client_random_auth_key(&auth_key2, &client_random, "test.example.com") {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!validate_client_random_auth_key(
+                    &auth_key2,
+                    &client_random,
+                    "test.example.com"
+                ))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_validation_short_client_random() {
-        let auth_key = hex::decode("aabbccddeeff00112233445566778899").unwrap();
+    fn test_auth_key_validation_short_client_random() -> Result<(), Box<dyn std::error::Error>> {
+        let auth_key = hex::decode("aabbccddeeff00112233445566778899")?;
         let client_random = vec![0u8; 16];
 
-        assert!(!validate_client_random_auth_key(
-            &auth_key,
-            &client_random,
-            "test.example.com"
-        ));
+        if validate_client_random_auth_key(&auth_key, &client_random, "test.example.com") {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!validate_client_random_auth_key(
+                    &auth_key,
+                    &client_random,
+                    "test.example.com"
+                ))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_rule_matches_auth_key_takes_priority_over_prefix() {
-        let auth_key = hex::decode("aabbccddeeff00112233445566778899").unwrap();
-        let client_random = derive_client_random(&auth_key, "test.example.com");
+    fn test_rule_matches_auth_key_takes_priority_over_prefix(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let auth_key = hex::decode("aabbccddeeff00112233445566778899")?;
+        let client_random = derive_client_random(&auth_key, "test.example.com")?;
         // Prefix does NOT match the derived client_random, auth key does.
         let rule = Rule {
             cidr: None,
@@ -583,15 +785,22 @@ mod tests {
             action: RuleAction::Allow,
         };
 
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
 
-        assert!(rule.matches(&ip, Some(&client_random), Some("test.example.com")));
+        if !(rule.matches(&ip, Some(&client_random), Some("test.example.com"))) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(rule.matches(&ip, Some(&client_random), Some("test.example.com")))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_rule_matches_auth_key_requires_sni() {
-        let auth_key = hex::decode("aabbccddeeff00112233445566778899").unwrap();
-        let client_random = derive_client_random(&auth_key, "test.example.com");
+    fn test_rule_matches_auth_key_requires_sni() -> Result<(), Box<dyn std::error::Error>> {
+        let auth_key = hex::decode("aabbccddeeff00112233445566778899")?;
+        let client_random = derive_client_random(&auth_key, "test.example.com")?;
         let rule = Rule {
             cidr: None,
             client_random_prefix: None,
@@ -599,14 +808,22 @@ mod tests {
             action: RuleAction::Allow,
         };
 
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
 
         // No SNI provided -> auth key cannot be validated -> rule does not match
-        assert!(!rule.matches(&ip, Some(&client_random), None));
+        if rule.matches(&ip, Some(&client_random), None) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(&ip, Some(&client_random), None))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_engine_fails_closed_when_client_random_missing_for_auth_key() {
+    fn test_engine_fails_closed_when_client_random_missing_for_auth_key(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let rules = RulesConfig {
             rule: vec![Rule {
                 cidr: None,
@@ -617,50 +834,89 @@ mod tests {
         };
 
         let engine = RulesEngine::from_config(rules);
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
         let client_random = derive_client_random(
-            &hex::decode("aabbccddeeff00112233445566778899").unwrap(),
+            &hex::decode("aabbccddeeff00112233445566778899")?,
             "test.example.com",
-        );
+        )?;
 
         // Missing client_random -> deny (defense-in-depth)
-        assert_eq!(
-            engine.evaluate(&ip, None, Some("test.example.com")),
-            RuleEvaluation::Deny
+        let (actual, expected) = (
+            &(engine.evaluate(&ip, None, Some("test.example.com"))),
+            &(RuleEvaluation::Deny),
         );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
         // Missing sni -> deny
-        assert_eq!(
-            engine.evaluate(&ip, Some(&client_random), None),
-            RuleEvaluation::Deny
+        let (actual, expected) = (
+            &(engine.evaluate(&ip, Some(&client_random), None)),
+            &(RuleEvaluation::Deny),
         );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
         // Valid auth key handshake -> allow
-        assert_eq!(
-            engine.evaluate(&ip, Some(&client_random), Some("test.example.com")),
-            RuleEvaluation::Allow
+        let (actual, expected) = (
+            &(engine.evaluate(&ip, Some(&client_random), Some("test.example.com"))),
+            &(RuleEvaluation::Allow),
         );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_engine_auth_key_with_cidr_both_must_match() {
+    fn test_engine_auth_key_with_cidr_both_must_match() -> Result<(), Box<dyn std::error::Error>> {
         let rule = Rule {
             cidr: Some("192.168.1.0/24".to_string()),
             client_random_prefix: None,
             client_random_auth_key: Some("aabbccddeeff00112233445566778899".to_string()),
             action: RuleAction::Allow,
         };
-        let auth_key = hex::decode("aabbccddeeff00112233445566778899").unwrap();
-        let client_random = derive_client_random(&auth_key, "test.example.com");
+        let auth_key = hex::decode("aabbccddeeff00112233445566778899")?;
+        let client_random = derive_client_random(&auth_key, "test.example.com")?;
 
-        let ip_match = IpAddr::from_str("192.168.1.50").unwrap();
-        let ip_no_match = IpAddr::from_str("10.0.0.5").unwrap();
+        let ip_match = IpAddr::from_str("192.168.1.50")?;
+        let ip_no_match = IpAddr::from_str("10.0.0.5")?;
 
         // CIDR and auth key are AND: the rule matches only when both are satisfied
-        assert!(rule.matches(&ip_match, Some(&client_random), Some("test.example.com")));
-        assert!(!rule.matches(&ip_no_match, Some(&client_random), Some("test.example.com")));
+        if !(rule.matches(&ip_match, Some(&client_random), Some("test.example.com"))) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(rule.matches(&ip_match, Some(&client_random), Some("test.example.com")))
+            )
+            .into());
+        }
+        if rule.matches(&ip_no_match, Some(&client_random), Some("test.example.com")) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(!rule.matches(
+                    &ip_no_match,
+                    Some(&client_random),
+                    Some("test.example.com")
+                ))
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_engine_empty_sni_denied_for_auth_key_rules() {
+    fn test_engine_empty_sni_denied_for_auth_key_rules() -> Result<(), Box<dyn std::error::Error>> {
         let rules = RulesConfig {
             rule: vec![Rule {
                 cidr: None,
@@ -670,16 +926,38 @@ mod tests {
             }],
         };
         let engine = RulesEngine::from_config(rules);
-        let ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let ip = IpAddr::from_str("127.0.0.1")?;
         let client_random = derive_client_random(
-            &hex::decode("aabbccddeeff00112233445566778899").unwrap(),
+            &hex::decode("aabbccddeeff00112233445566778899")?,
             "test.example.com",
-        );
+        )?;
 
         // Empty SNI (QUIC bootstrap case) → Deny
-        assert_eq!(
-            engine.evaluate(&ip, Some(&client_random), Some("")),
-            RuleEvaluation::Deny
+        let (actual, expected) = (
+            &(engine.evaluate(&ip, Some(&client_random), Some(""))),
+            &(RuleEvaluation::Deny),
         );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn debug_scrubs_auth_keys() {
+        let auth_key = "aabbccddeeff00112233445566778899";
+        let engine = RulesEngine::from_config(RulesConfig {
+            rule: vec![Rule {
+                cidr: None,
+                client_random_prefix: None,
+                client_random_auth_key: Some(auth_key.into()),
+                action: RuleAction::Allow,
+            }],
+        });
+        assert!(!format!("{engine:?}").contains(auth_key));
     }
 }

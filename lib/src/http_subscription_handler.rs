@@ -8,25 +8,28 @@ use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
-pub(crate) async fn listen(
+pub async fn listen(
     context: Arc<core::Context>,
     mut codec: Box<dyn HttpCodec>,
     sni: String,
     log_id: log_utils::IdChain<u64>,
 ) {
     let (mut shutdown_notification, _shutdown_completion) = {
-        let shutdown = context.shutdown.lock().unwrap();
+        let shutdown = context.shutdown.lock().unwrap_or_else(|e| {
+            log_id!(error, log_id, "Recovering poisoned shutdown lock: {}", e);
+            e.into_inner()
+        });
         (shutdown.notification_handler(), shutdown.completion_guard())
     };
 
     tokio::select! {
         x = shutdown_notification.wait() => {
             match x {
-                Ok(_) => (),
+                Ok(()) => (),
                 Err(e) => log_id!(debug, log_id, "Shutdown notification failure: {}", e),
             }
         },
-        _ = listen_inner(context, codec.as_mut(), sni, &log_id) => (),
+        () = listen_inner(context, codec.as_mut(), sni, &log_id) => (),
     }
 
     if let Err(e) = codec.graceful_shutdown().await {
@@ -86,7 +89,11 @@ async fn handle_stream(
     // Precedence: SNI mismatch -> 404, bad creds -> 401, disabled -> 403,
     // non-GET -> 405, then 200. SNI is checked before auth so the endpoint never
     // serves subscription data on the wrong TLS host.
-    let config = context.subscription.read().unwrap().clone();
+    let config = context
+        .subscription
+        .read()
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .clone();
     let Some(config) = config else {
         respond.send_bad_response(StatusCode::NOT_FOUND, vec![])?;
         return Ok(());
@@ -145,7 +152,7 @@ async fn handle_stream(
         .header(http::header::CONTENT_TYPE, "application/json")
         .header(http::header::CONTENT_LENGTH, body.len().to_string())
         .body(())
-        .unwrap()
+        .map_err(|e| io::Error::other(format!("Invalid subscription response: {e}")))?
         .into_parts()
         .0;
 
@@ -157,7 +164,7 @@ async fn handle_stream(
     Ok(())
 }
 
-/// Decode `Authorization: Basic <b64>` and match it against the credential registry.
+/// Decode `Authorization: Basic ***` and match it against the credential registry.
 fn authenticate(context: &core::Context, headers: &http::HeaderMap) -> Option<(String, String)> {
     let header = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
     let encoded = header.strip_prefix("Basic ")?.trim();

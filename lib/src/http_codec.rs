@@ -1,5 +1,5 @@
 use crate::tls_demultiplexer::Protocol;
-use crate::{authentication, datagram_pipe, log_utils, net_utils, pipe};
+use crate::{authentication, datagram_pipe, log_id, log_utils, net_utils, pipe};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::uri::Authority;
@@ -7,11 +7,11 @@ use http::{Response, StatusCode};
 use std::io;
 use std::net::IpAddr;
 
-pub(crate) type RequestHeaders = http::request::Parts;
-pub(crate) type ResponseHeaders = http::response::Parts;
+pub type RequestHeaders = http::request::Parts;
+pub type ResponseHeaders = http::response::Parts;
 
 /// Encapsulates an HTTP stream implementation
-pub(crate) trait Stream: Send {
+pub trait Stream: Send {
     /// Get the request ID for logging
     fn id(&self) -> log_utils::IdChain<u64>;
 
@@ -23,7 +23,7 @@ pub(crate) trait Stream: Send {
 }
 
 /// Encapsulates a receiving part of an HTTP stream state
-pub(crate) trait PendingRequest: Send {
+pub trait PendingRequest: Send {
     /// Get the request ID for logging
     fn id(&self) -> log_utils::IdChain<u64>;
 
@@ -33,15 +33,13 @@ pub(crate) trait PendingRequest: Send {
     /// Clone the request headers of the stream
     fn clone_request(&self) -> RequestHeaders {
         let request = self.request();
-        let mut builder = http::Request::builder()
-            .method(request.method.clone())
-            .uri(request.uri.clone())
-            .version(request.version);
-        if let Some(hs) = builder.headers_mut() {
-            *hs = request.headers.clone();
-        }
+        let mut cloned = http::Request::<()>::default().into_parts().0;
+        cloned.method.clone_from(&request.method);
+        cloned.uri.clone_from(&request.uri);
+        cloned.version = request.version;
+        cloned.headers.clone_from(&request.headers);
         // assume it's ok as original headers were built successfully
-        builder.body(()).unwrap().into_parts().0
+        cloned
     }
 
     /// Get the address of a VPN client made the connection request
@@ -49,13 +47,12 @@ pub(crate) trait PendingRequest: Send {
 
     /// Get the authorization info if some
     fn auth_info(&self) -> io::Result<Option<authentication::Source<'_>>> {
-        let header = match self
+        let Some(header) = self
             .request()
             .headers
             .get(http::header::PROXY_AUTHORIZATION)
-        {
-            None => return Ok(None),
-            Some(x) => x,
+        else {
+            return Ok(None);
         };
 
         header
@@ -94,9 +91,8 @@ pub(crate) trait PendingRequest: Send {
 }
 
 /// Encapsulates a non-responded transmitting part of an HTTP stream state
-pub(crate) trait PendingRespond: Send {
+pub trait PendingRespond: Send {
     /// Get the request ID for logging
-    #[allow(dead_code)]
     fn id(&self) -> log_utils::IdChain<u64>;
 
     /// Send the intermediate response to a client. Unlike `send_response()`,
@@ -128,7 +124,8 @@ pub(crate) trait PendingRespond: Send {
             for (n, v) in extra_headers {
                 b = b.header(n, v);
             }
-            b.body(()).unwrap()
+            b.body(())
+                .map_err(|e| io::Error::other(format!("Invalid response: {e}")))?
         };
 
         self.send_response(response.into_parts().0, true)
@@ -137,19 +134,19 @@ pub(crate) trait PendingRespond: Send {
 }
 
 /// An abstract interface for a datagram transmitter implementation
-pub(crate) trait DroppingSink: Send {
+pub trait DroppingSink: Send {
     fn write(&mut self, data: Bytes) -> io::Result<datagram_pipe::SendStatus>;
 }
 
 /// A helper trait which converts a stream sink wrapper into one of the sink types
-pub(crate) trait RespondedStreamSink: Send {
+pub trait RespondedStreamSink: Send {
     fn into_pipe_sink(self: Box<Self>) -> Box<dyn pipe::Sink>;
     fn into_datagram_sink(self: Box<Self>) -> Box<dyn DroppingSink>;
 }
 
 /// An abstract interface for an HTTP server-side session implementation
 #[async_trait]
-pub(crate) trait HttpCodec: Send {
+pub trait HttpCodec: Send {
     /// Listen to IO events.
     /// Returns `None` in case the listening finished gracefully and should not be continued,
     /// `Some` in case a client initiated the new stream which should be processed and listening
@@ -164,7 +161,7 @@ pub(crate) trait HttpCodec: Send {
 }
 
 /// Turn a [`Stream`] into a [`HttpCodec`] which produces the single stream.
-pub(crate) fn stream_into_codec(stream: Box<dyn Stream>, protocol: Protocol) -> impl HttpCodec {
+pub fn stream_into_codec(stream: Box<dyn Stream>, protocol: Protocol) -> impl HttpCodec {
     SingleRequestCodec {
         stream: Some(stream),
         protocol,
@@ -188,7 +185,12 @@ impl HttpCodec for SingleRequestCodec {
 
     async fn graceful_shutdown(&mut self) -> io::Result<()> {
         if let Some((_, respond)) = self.stream.take().map(Stream::split) {
-            let _ = respond.send_bad_response(http::StatusCode::INTERNAL_SERVER_ERROR, vec![]);
+            let id = respond.id();
+            if let Err(e) =
+                respond.send_bad_response(http::StatusCode::INTERNAL_SERVER_ERROR, vec![])
+            {
+                log_id!(debug, id, "Failed to send shutdown response: {}", e);
+            }
         }
 
         Ok(())

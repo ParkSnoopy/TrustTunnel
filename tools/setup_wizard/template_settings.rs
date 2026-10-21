@@ -1,11 +1,10 @@
-use once_cell::sync::Lazy;
 use trusttunnel::settings::{
     ForwardProtocolSettings, Http1Settings, Http2Settings, IcmpSettings, ListenProtocolSettings,
     MetricsSettings, QuicSettings, Settings, Socks5ForwarderSettings,
 };
 use trusttunnel::utils::ToTomlComment;
 
-pub static MAIN_TABLE: Lazy<String> = Lazy::new(|| {
+pub static MAIN_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         r#"{}
 listen_address = ""
@@ -104,38 +103,39 @@ auth_failure_status_code = {}
         Settings::doc_speedtest_enable().to_toml_comment(),
         Settings::default_speedtest_enable(),
         Settings::doc_speedtest_path().to_toml_comment(),
-        Settings::default_speedtest_path().unwrap(),
+        Settings::default_speedtest_path().unwrap_or_default(),
         Settings::doc_ping_enable().to_toml_comment(),
         Settings::default_ping_enable(),
         Settings::doc_ping_path().to_toml_comment(),
-        Settings::default_ping_path().unwrap(),
+        Settings::default_ping_path().unwrap_or_default(),
         Settings::doc_auth_failure_status_code().to_toml_comment(),
         Settings::default_auth_failure_status_code(),
     )
 });
 
-pub static FORWARD_PROTOCOL_COMMON_TABLE: Lazy<String> = Lazy::new(|| {
-    format!(
-        r#"{}.
+pub static FORWARD_PROTOCOL_COMMON_TABLE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r"{}.
 # Possible values:
 #   * direct: a direct forwarder routes a connection directly to its target host,
 #   * socks5: a SOCKS5 forwarder routes a connection though a SOCKS5 proxy.
 # Default is direct
 [forward_protocol]
-"#,
-        ForwardProtocolSettings::doc().to_toml_comment(),
-    )
-});
+",
+            ForwardProtocolSettings::doc().to_toml_comment(),
+        )
+    });
 
-pub static DIRECT_FORWARDER_TABLE: Lazy<String> = Lazy::new(|| {
+pub static DIRECT_FORWARDER_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        r#"{}.
-[forward_protocol.direct]"#,
+        r"{}.
+[forward_protocol.direct]",
         ForwardProtocolSettings::doc_direct().to_toml_comment(),
     )
 });
 
-pub static SOCKS_FORWARDER_TABLE: Lazy<String> = Lazy::new(|| {
+pub static SOCKS_FORWARDER_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         r#"{}.
 [forward_protocol.socks5]
@@ -149,36 +149,36 @@ extended_auth = false"#,
     )
 });
 
-pub static LISTENER_COMMON_TABLE: Lazy<String> = Lazy::new(|| {
+pub static LISTENER_COMMON_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        r#"{}.
+        r"{}.
 # Possible values:
 #   * http1: enables HTTP1 codec,
 #   * http2: enables HTTP2 codec,
 #   * quic: enables QUIC/HTTP3 codec.
 # At least one listener codec MUST be specified.
 [listen_protocols]
-"#,
+",
         ListenProtocolSettings::doc().to_toml_comment(),
     )
 });
 
-pub static HTTP1_LISTENER_TABLE: Lazy<String> = Lazy::new(|| {
+pub static HTTP1_LISTENER_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        r#"{}.
+        r"{}.
 [listen_protocols.http1]
 {}
 upload_buffer_size = {}
-"#,
+",
         Http1Settings::doc().to_toml_comment(),
         Http1Settings::doc_upload_buffer_size().to_toml_comment(),
         Http1Settings::default_upload_buffer_size(),
     )
 });
 
-pub static HTTP2_LISTENER_TABLE: Lazy<String> = Lazy::new(|| {
+pub static HTTP2_LISTENER_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        r#"{}.
+        r"{}.
 [listen_protocols.http2]
 {}
 initial_connection_window_size = {}
@@ -190,7 +190,7 @@ max_concurrent_streams = {}
 max_frame_size = {}
 {}
 header_table_size = {}
-"#,
+",
         Http2Settings::doc().to_toml_comment(),
         Http2Settings::doc_initial_connection_window_size().to_toml_comment(),
         Http2Settings::default_initial_connection_window_size(),
@@ -205,9 +205,9 @@ header_table_size = {}
     )
 });
 
-pub static QUIC_LISTENER_TABLE: Lazy<String> = Lazy::new(|| {
+pub static QUIC_LISTENER_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        r#"{}.
+        r"{}.
 [listen_protocols.quic]
 {}
 recv_udp_payload_size = {}
@@ -235,7 +235,7 @@ disable_active_migration = {}
 enable_early_data = {}
 {}
 message_queue_capacity = {}
-"#,
+",
         QuicSettings::doc().to_toml_comment(),
         QuicSettings::doc_recv_udp_payload_size().to_toml_comment(),
         QuicSettings::default_recv_udp_payload_size(),
@@ -266,7 +266,7 @@ message_queue_capacity = {}
     )
 });
 
-pub static ICMP_TABLE: Lazy<String> = Lazy::new(|| {
+pub static ICMP_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         r#"{}
 [icmp]
@@ -287,7 +287,7 @@ recv_message_queue_capacity = {}
     )
 });
 
-pub static METRICS_TABLE: Lazy<String> = Lazy::new(|| {
+pub static METRICS_TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         r#"{}
 [metrics]

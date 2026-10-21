@@ -4,13 +4,12 @@ use crate::{core, datagram_pipe, downstream, forwarder, log_id, log_utils, net_u
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::net::UdpSocket;
 use tokio::sync;
 
@@ -27,10 +26,19 @@ struct MultiplexerShared {
     context: Arc<core::Context>,
 }
 
+impl MultiplexerShared {
+    fn connections(&self) -> MutexGuard<'_, Connections> {
+        self.connections.lock().unwrap_or_else(|error| {
+            error!("Recovering poisoned UDP connections lock: {error}");
+            error.into_inner()
+        })
+    }
+}
+
 struct MultiplexerSource {
     shared: Arc<MultiplexerShared>,
     wake_rx: sync::mpsc::Receiver<()>,
-    pending_closures: LinkedList<(forwarder::UdpDatagramMeta, io::Error)>,
+    pending_closures: VecDeque<(forwarder::UdpDatagramMeta, io::Error)>,
     parent_id_chain: log_utils::IdChain<u64>,
 }
 
@@ -49,26 +57,26 @@ enum PollStatus {
     SocketError(SocketError),
 }
 
-pub(crate) fn make_multiplexer(
+pub fn make_multiplexer(
     context: Arc<core::Context>,
     id: log_utils::IdChain<u64>,
-) -> io::Result<UdpMultiplexer> {
+) -> UdpMultiplexer {
     let shared = Arc::new(MultiplexerShared {
-        connections: Mutex::new(Default::default()),
+        connections: Mutex::new(HashMap::default()),
         context,
     });
     let (wake_tx, wake_rx) = sync::mpsc::channel(1);
 
-    Ok((
+    (
         shared.clone(),
         Box::new(MultiplexerSource {
             shared: shared.clone(),
             wake_rx,
-            pending_closures: Default::default(),
+            pending_closures: VecDeque::default(),
             parent_id_chain: id,
         }),
         Box::new(MultiplexerSink { shared, wake_tx }),
-    ))
+    )
 }
 
 async fn listen_socket_read(
@@ -78,20 +86,13 @@ async fn listen_socket_read(
     socket
         .readable()
         .await
-        .map(|_| meta)
+        .map(|()| meta)
         .map_err(|io| SocketError { meta, io })
 }
 
 impl MultiplexerSource {
     fn on_socket_error(&mut self, meta: &forwarder::UdpDatagramMeta, error: io::Error) {
-        if self
-            .shared
-            .connections
-            .lock()
-            .unwrap()
-            .remove(meta)
-            .is_some()
-        {
+        if self.shared.connections().remove(meta).is_some() {
             self.pending_closures.push_back((*meta, error));
         }
     }
@@ -102,9 +103,7 @@ impl MultiplexerSource {
     ) -> Option<forwarder::UdpDatagramReadStatus> {
         let socket = self
             .shared
-            .connections
-            .lock()
-            .unwrap()
+            .connections()
             .get(meta)
             .map(|conn| conn.socket.clone())?;
 
@@ -131,13 +130,14 @@ impl MultiplexerSource {
                     + Send,
             >;
 
-            let connections = self.shared.connections.lock().unwrap();
+            let connections = self.shared.connections();
             let mut futures: Vec<Pin<Future>> = Vec::with_capacity(1 + connections.len());
             // add always pending future to avoid a busy loop in case of connection absence
             futures.push(Box::pin(futures::future::pending()));
-            for (meta, conn) in connections.deref() {
+            for (meta, conn) in &*connections {
                 futures.push(Box::pin(listen_socket_read(*meta, conn.socket.clone())));
             }
+            drop(connections);
             futures
         };
 
@@ -148,7 +148,7 @@ impl MultiplexerSource {
         tokio::pin!(wait_waker);
 
         tokio::select! {
-            reads = wait_reads => match reads.0 {
+            event = wait_reads => match event.0 {
                 Ok(ready) => Ok(Some(PollStatus::PendingRead(ready))),
                 Err(e) => {
                     log_id!(debug, self.parent_id_chain, "Error waiting for UDP read: meta={:?} error={}",
@@ -156,12 +156,9 @@ impl MultiplexerSource {
                     Ok(Some(PollStatus::SocketError(e)))
                 }
             },
-            r = wait_waker => match r {
-                Some(_) => Ok(None),
-                None => {
-                    log_id!(debug, self.parent_id_chain, "Wake sender dropped");
-                    Err(io::Error::from(ErrorKind::UnexpectedEof))
-                }
+            r = wait_waker => if r == Some(()) { Ok(None) } else {
+                log_id!(debug, self.parent_id_chain, "Wake sender dropped");
+                Err(io::Error::from(ErrorKind::UnexpectedEof))
             }
         }
     }
@@ -181,9 +178,7 @@ impl forwarder::UdpDatagramPipeShared for MultiplexerShared {
         }
 
         match self
-            .connections
-            .lock()
-            .unwrap()
+            .connections()
             .entry(forwarder::UdpDatagramMeta::from(meta))
         {
             Entry::Occupied(_) => Err(io::Error::other("Already present")),
@@ -200,7 +195,7 @@ impl forwarder::UdpDatagramPipeShared for MultiplexerShared {
     }
 
     fn on_connection_closed(&self, meta: &forwarder::UdpDatagramMeta) {
-        self.connections.lock().unwrap().remove(&meta.reversed());
+        self.connections().remove(&meta.reversed());
     }
 }
 
@@ -226,7 +221,7 @@ impl datagram_pipe::Source for MultiplexerSource {
                     }
                 }
                 Some(PollStatus::SocketError(SocketError { meta, io })) => {
-                    self.on_socket_error(&meta, io)
+                    self.on_socket_error(&meta, io);
                 }
             }
         }
@@ -244,25 +239,22 @@ impl datagram_pipe::Sink for MultiplexerSink {
         let meta = forwarder::UdpDatagramMeta::from(&datagram.meta);
         let socket = self
             .shared
-            .connections
-            .lock()
-            .unwrap()
+            .connections()
             .get(&meta)
             .map(|c| c.socket.clone())
             .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
 
         socket.send(datagram.payload.as_ref()).await?;
 
-        if let Some(conn) = self.shared.connections.lock().unwrap().get_mut(&meta) {
+        if let Some(conn) = self.shared.connections().get_mut(&meta) {
             if !conn.being_listened {
                 match self.wake_tx.try_send(()) {
-                    Ok(_) | Err(sync::mpsc::error::TrySendError::Full(_)) => {
+                    Ok(()) | Err(sync::mpsc::error::TrySendError::Full(())) => {
                         conn.being_listened = true;
                     }
                     Err(e) => {
                         return Err(io::Error::other(format!(
-                            "Failed to wake up UDP listener task: {}",
-                            e
+                            "Failed to wake up UDP listener task: {e}"
                         )))
                     }
                 }

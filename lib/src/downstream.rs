@@ -8,36 +8,36 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Hash, PartialEq, Eq)]
-pub(crate) struct UdpDatagramMeta {
+pub struct UdpDatagramMeta {
     pub source: SocketAddr,
     pub destination: SocketAddr,
     pub app_name: Option<String>,
 }
 
-pub(crate) struct UdpDatagram {
+pub struct UdpDatagram {
     pub meta: UdpDatagramMeta,
     pub payload: Bytes,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
-pub(crate) struct IcmpDatagramMeta {
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct IcmpDatagramMeta {
     pub peer: IpAddr,
 }
 
 #[derive(Debug)]
-pub(crate) struct IcmpDatagram {
+pub struct IcmpDatagram {
     pub meta: IcmpDatagramMeta,
     pub message: icmp_utils::Message,
     pub ttl: u8,
 }
 
-pub(crate) trait StreamId {
+pub trait StreamId {
     /// Get the request ID for logging
     fn id(&self) -> log_utils::IdChain<u64>;
 }
 
 /// An abstract interface for a still-not-responded request
-pub(crate) trait PendingRequest: StreamId + Send {
+pub trait PendingRequest: StreamId + Send {
     type NextState;
 
     /// Proceed the request to the next state
@@ -48,20 +48,20 @@ pub(crate) trait PendingRequest: StreamId + Send {
 }
 
 /// An abstract interface for a pre-demultiplexed request
-pub(crate) trait PendingMultiplexedRequest:
+pub trait PendingMultiplexedRequest:
     StreamId + PendingRequest<NextState = Option<PendingDemultiplexedRequest>> + Send
 {
     /// Get the authorization info
     fn auth_info(&self) -> io::Result<Option<authentication::Source<'_>>>;
 }
 
-pub(crate) enum PendingDemultiplexedRequest {
+pub enum PendingDemultiplexedRequest {
     TcpConnect(Box<dyn PendingTcpConnectRequest>),
     DatagramMultiplexer(Box<dyn PendingDatagramMultiplexerRequest>),
 }
 
 /// An abstract interface for a TCP connection request implementation
-pub(crate) trait PendingTcpConnectRequest:
+pub trait PendingTcpConnectRequest:
     StreamId + PendingRequest<NextState = (Box<dyn pipe::Source>, Box<dyn pipe::Sink>)> + Send
 {
     /// Get the address of a VPN client made the connection request
@@ -74,7 +74,7 @@ pub(crate) trait PendingTcpConnectRequest:
     fn user_agent(&self) -> Option<String>;
 }
 
-pub(crate) enum DatagramPipeHalves {
+pub enum DatagramPipeHalves {
     Udp(
         Box<dyn datagram_pipe::Source<Output = UdpDatagram>>,
         Box<dyn datagram_pipe::Sink<Input = forwarder::UdpDatagram>>,
@@ -86,7 +86,7 @@ pub(crate) enum DatagramPipeHalves {
 }
 
 /// An abstract interface for a datagram multiplexer open request implementation
-pub(crate) trait PendingDatagramMultiplexerRequest:
+pub trait PendingDatagramMultiplexerRequest:
     StreamId + PendingRequest<NextState = DatagramPipeHalves> + Send
 {
     /// Get the address of a VPN client made the connection request
@@ -98,7 +98,7 @@ pub(crate) trait PendingDatagramMultiplexerRequest:
 
 /// An abstract interface for a downstream implementation which communicates with a client
 #[async_trait]
-pub(crate) trait Downstream: Send {
+pub trait Downstream: Send {
     /// Listen to events on the client-side.
     /// Returns `None` in case the listening finished gracefully and should not be continued,
     /// `Some` in case the downstream encountered the new authorization request which should be

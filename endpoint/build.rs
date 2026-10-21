@@ -1,3 +1,5 @@
+//! Resolve the endpoint version for local and release builds.
+
 // Build script that resolves the endpoint version the same way the rest of the
 // organization does: from a CI-provided override first, then from the git tag.
 // The static `version` field in Cargo.toml is a placeholder (0.0.0) and is never
@@ -8,6 +10,7 @@
 //   1. TRUSTTUNNEL_VERSION environment variable (CI sets it from CHANGELOG.md);
 //   2. git describe --tags --match 'v*' (a plain local build is self-versioning);
 //   3. 0.0.0-git fallback (never hard-fails the build).
+use std::io::{self, Write};
 use std::process::Command;
 
 fn resolve_version() -> String {
@@ -36,11 +39,12 @@ fn resolve_version() -> String {
     "0.0.0-git".to_string()
 }
 
-fn main() {
+fn main() -> io::Result<()> {
+    let mut output = io::stdout().lock();
     // Re-run when the override or the resolved git state changes.
-    println!("cargo:rerun-if-env-changed=TRUSTTUNNEL_VERSION");
-    println!("cargo:rerun-if-changed=../.git/HEAD");
+    writeln!(output, "cargo:rerun-if-env-changed=TRUSTTUNNEL_VERSION")?;
+    writeln!(output, "cargo:rerun-if-changed=../.git/HEAD")?;
 
     let version = resolve_version();
-    println!("cargo:rustc-env=TRUSTTUNNEL_VERSION={version}");
+    writeln!(output, "cargo:rustc-env=TRUSTTUNNEL_VERSION={version}")
 }

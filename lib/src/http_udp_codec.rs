@@ -33,7 +33,7 @@ const UDPPKT_OUT_FIXED_HEADER_NO_LENGTH_SIZE: usize =
 const MAX_UDP_IN_PAYLOAD_SIZE: usize =
     net_utils::MAX_UDP_PAYLOAD_SIZE - UDPPKT_IN_FIXED_HEADER_NO_LENGTH_SIZE;
 
-pub(crate) struct Decoder {
+pub struct Decoder {
     state: RecvState,
     total_length: usize,
     buffer: BytesMut,
@@ -44,14 +44,14 @@ pub(crate) struct Decoder {
 }
 
 #[derive(Default)]
-pub(crate) struct Encoder {}
+pub struct Encoder {}
 
 impl Decoder {
     pub fn new(id: log_utils::IdChain<u64>) -> Self {
         Self {
-            state: Default::default(),
+            state: RecvState::default(),
             total_length: 0,
-            buffer: Default::default(),
+            buffer: BytesMut::default(),
             source: None,
             destination: None,
             app_name: None,
@@ -59,30 +59,32 @@ impl Decoder {
         }
     }
 
-    fn decode_chunk_once(&mut self, mut data: Bytes) -> (Option<downstream::UdpDatagram>, Bytes) {
-        match self.state {
+    fn decode_chunk_once(
+        &mut self,
+        mut data: Bytes,
+    ) -> std::io::Result<(Option<downstream::UdpDatagram>, Bytes)> {
+        Ok(match self.state {
             RecvState::Length => (None, self.process_client_length(data)),
-            RecvState::FixedHeader => (None, self.process_client_fixed_header(data)),
+            RecvState::FixedHeader => (None, self.process_client_fixed_header(data)?),
             RecvState::AppName(length) => (None, self.process_client_app_name(length, data)),
-            RecvState::Payload(length) => self.process_client_payload(length, data),
+            RecvState::Payload(length) => return self.process_client_payload(length, data),
             RecvState::Dropping(remaining_length) => {
                 let to_drop = remaining_length.min(data.len());
 
                 if remaining_length <= to_drop {
-                    self.state = RecvState::Length
+                    self.state = RecvState::Length;
                 } else {
-                    self.state = RecvState::Dropping(remaining_length - to_drop)
+                    self.state = RecvState::Dropping(remaining_length - to_drop);
                 }
 
                 (None, data.split_to(to_drop))
             }
-        }
+        })
     }
 
     fn process_client_length(&mut self, data: Bytes) -> Bytes {
-        let (mut raw_length, tail) = match self.buffered_read(data, UDPPKT_LENGTH_SIZE) {
-            Some(x) => x,
-            None => return Bytes::new(),
+        let Some((mut raw_length, tail)) = self.buffered_read(data, UDPPKT_LENGTH_SIZE) else {
+            return Bytes::new();
         };
 
         self.total_length = raw_length.get_u32() as usize;
@@ -101,19 +103,26 @@ impl Decoder {
         tail
     }
 
-    fn process_client_fixed_header(&mut self, data: Bytes) -> Bytes {
-        let (mut header, tail) =
-            match self.buffered_read(data, UDPPKT_IN_FIXED_HEADER_NO_LENGTH_SIZE) {
-                Some(x) => x,
-                None => return Bytes::new(),
-            };
+    fn process_client_fixed_header(&mut self, data: Bytes) -> std::io::Result<Bytes> {
+        let Some((mut header, tail)) =
+            self.buffered_read(data, UDPPKT_IN_FIXED_HEADER_NO_LENGTH_SIZE)
+        else {
+            return Ok(Bytes::new());
+        };
 
         self.source = Some(SocketAddr::new(
-            net_utils::get_fixed_size_ip(&mut header),
+            net_utils::get_fixed_size_ip(&mut header).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Incomplete UDP source")
+            })?,
             header.get_u16(),
         ));
         self.destination = Some(SocketAddr::new(
-            net_utils::get_fixed_size_ip(&mut header),
+            net_utils::get_fixed_size_ip(&mut header).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Incomplete UDP destination",
+                )
+            })?,
             header.get_u16(),
         ));
         let app_name_length = header.get_u8() as usize;
@@ -139,13 +148,12 @@ impl Decoder {
                 RecvState::Dropping(self.total_length - UDPPKT_IN_FIXED_HEADER_NO_LENGTH_SIZE);
         }
 
-        tail
+        Ok(tail)
     }
 
     fn process_client_app_name(&mut self, length: usize, data: Bytes) -> Bytes {
-        let (name, tail) = match self.buffered_read(data, length) {
-            Some(x) => x,
-            None => return Bytes::new(),
+        let Some((name, tail)) = self.buffered_read(data, length) else {
+            return Bytes::new();
         };
 
         let payload_length = self.total_length - UDPPKT_IN_FIXED_HEADER_NO_LENGTH_SIZE - length;
@@ -172,7 +180,7 @@ impl Decoder {
         &mut self,
         length: usize,
         mut data: Bytes,
-    ) -> (Option<downstream::UdpDatagram>, Bytes) {
+    ) -> std::io::Result<(Option<downstream::UdpDatagram>, Bytes)> {
         let (to_send, tail) = if self.buffer.is_empty() && data.len() >= length {
             (data.split_to(length), data)
         } else {
@@ -180,24 +188,28 @@ impl Decoder {
             self.buffer
                 .extend_from_slice(data.split_to(to_drain).as_ref());
             if self.buffer.len() < length {
-                return (None, data);
+                return Ok((None, data));
             }
 
             (std::mem::take(&mut self.buffer).freeze(), data)
         };
 
         self.state = RecvState::Length;
-        (
+        Ok((
             Some(downstream::UdpDatagram {
                 meta: downstream::UdpDatagramMeta {
-                    source: self.source.unwrap(),
-                    destination: self.destination.unwrap(),
+                    source: self
+                        .source
+                        .ok_or_else(|| std::io::Error::other("Missing UDP source"))?,
+                    destination: self
+                        .destination
+                        .ok_or_else(|| std::io::Error::other("Missing UDP destination"))?,
                     app_name: self.app_name.take(),
                 },
                 payload: to_send,
             }),
             tail,
-        )
+        ))
     }
 
     fn buffered_read(&mut self, mut input: Bytes, cap: usize) -> Option<(Bytes, Bytes)> {
@@ -230,8 +242,9 @@ impl http_datagram_codec::Decoder for Decoder {
     ) -> http_datagram_codec::DecodeResult<Self::Datagram> {
         while !data.is_empty() {
             match self.decode_chunk_once(data) {
-                (Some(d), tail) => return http_datagram_codec::DecodeResult::Complete(d, tail),
-                (None, tail) => data = tail,
+                Ok((Some(d), tail)) => return http_datagram_codec::DecodeResult::Complete(d, tail),
+                Ok((None, tail)) => data = tail,
+                Err(e) => return http_datagram_codec::DecodeResult::Error(e),
             }
         }
 
@@ -284,11 +297,12 @@ mod tests {
     use crate::http_udp_codec;
     use crate::http_udp_codec::UDPPKT_IN_FIXED_HEADER_NO_LENGTH_SIZE;
     use crate::log_utils::IdChain;
+    use crate::utils::check;
     use bytes::{BufMut, Bytes};
     use std::net::Ipv4Addr;
 
     #[test]
-    fn decode() {
+    fn decode() -> std::io::Result<()> {
         const APP_NAME: &str = "test";
         const PAYLOAD: &str = "hello world!";
         const SOURCE_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -310,19 +324,41 @@ mod tests {
         buffer.put_slice(APP_NAME.as_bytes());
         buffer.put_slice(PAYLOAD.as_bytes());
 
-        let mut decoder = http_udp_codec::Decoder::new(IdChain::empty());
-        match decoder.decode_chunk(Bytes::from(buffer)) {
-            DecodeResult::WantMore => unreachable!(),
-            DecodeResult::Complete(datagram, tail) => {
-                assert_eq!(datagram.meta.source, (SOURCE_IP, SOURCE_PORT).into());
-                assert_eq!(
-                    datagram.meta.destination,
-                    (DESTINATION_IP, DESTINATION_PORT).into()
-                );
-                assert_eq!(datagram.meta.app_name.as_deref(), Some(APP_NAME));
-                assert_eq!(&datagram.payload, PAYLOAD.as_bytes());
-                assert_eq!(tail.len(), 0);
+        let buffer = Bytes::from(buffer);
+        for split in 0..buffer.len() {
+            let mut decoder = http_udp_codec::Decoder::new(IdChain::empty());
+            if split > 0 {
+                check(
+                    matches!(
+                        decoder.decode_chunk(buffer.slice(..split)),
+                        DecodeResult::WantMore
+                    ),
+                    "Expected partial UDP packet",
+                )?;
+            }
+            match decoder.decode_chunk(buffer.slice(split..)) {
+                DecodeResult::WantMore => {
+                    return Err(std::io::Error::other("Expected complete UDP packet"))
+                }
+                DecodeResult::Error(e) => return Err(e),
+                DecodeResult::Complete(datagram, tail) => {
+                    check(
+                        datagram.meta.source == (SOURCE_IP, SOURCE_PORT).into(),
+                        "Unexpected source",
+                    )?;
+                    check(
+                        datagram.meta.destination == (DESTINATION_IP, DESTINATION_PORT).into(),
+                        "Unexpected destination",
+                    )?;
+                    check(
+                        datagram.meta.app_name.as_deref() == Some(APP_NAME),
+                        "Unexpected app name",
+                    )?;
+                    check(datagram.payload == PAYLOAD.as_bytes(), "Unexpected payload")?;
+                    check(tail.is_empty(), "Unexpected packet tail")?;
+                }
             }
         }
+        Ok(())
     }
 }

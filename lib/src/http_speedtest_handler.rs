@@ -22,7 +22,7 @@ enum Speedtest {
     Upload(u32),
 }
 
-pub(crate) async fn listen(
+pub async fn listen(
     shutdown: Arc<Mutex<Shutdown>>,
     mut codec: Box<dyn HttpCodec>,
     timeout: Duration,
@@ -30,18 +30,21 @@ pub(crate) async fn listen(
     log_id: log_utils::IdChain<u64>,
 ) {
     let (mut shutdown_notification, _shutdown_completion) = {
-        let shutdown = shutdown.lock().unwrap();
+        let shutdown = shutdown.lock().unwrap_or_else(|e| {
+            log_id!(error, log_id, "Recovering poisoned shutdown lock: {}", e);
+            e.into_inner()
+        });
         (shutdown.notification_handler(), shutdown.completion_guard())
     };
 
     tokio::select! {
         x = shutdown_notification.wait() => {
             match x {
-                Ok(_) => (),
+                Ok(()) => (),
                 Err(e) => log_id!(debug, log_id, "Shutdown notification failure: {}", e),
             }
         },
-        _ = listen_inner(codec.as_mut(), timeout, base_path.as_deref(), &log_id) => (),
+        () = listen_inner(codec.as_mut(), timeout, base_path.as_deref(), &log_id) => (),
     }
 
     if let Err(e) = codec.graceful_shutdown().await {
@@ -88,7 +91,7 @@ async fn listen_inner(
                         if let Err(e) = x
                             .split()
                             .1
-                            .send_bad_response(http::StatusCode::BAD_REQUEST, Default::default())
+                            .send_bad_response(http::StatusCode::BAD_REQUEST, Vec::new())
                         {
                             log_id!(debug, log_id, "Failed to send bad response: {}", e);
                         }
@@ -128,19 +131,15 @@ fn prepare_speedtest(
     base_path: Option<&str>,
 ) -> Result<Speedtest, String> {
     let original_path = request.uri.path();
-    let path = if let Some(base_path) = base_path {
-        if let Some(x) = original_path.strip_prefix(base_path) {
+    let path = base_path
+        .and_then(|base_path| original_path.strip_prefix(base_path))
+        .map_or(Cow::Borrowed(original_path), |x| {
             if x.starts_with('/') {
                 Cow::Borrowed(x)
             } else {
                 Cow::Owned(format!("/{x}"))
             }
-        } else {
-            Cow::Borrowed(original_path)
-        }
-    } else {
-        Cow::Borrowed(original_path)
-    };
+        });
 
     match request.method {
         http::Method::GET => path
@@ -169,17 +168,20 @@ fn prepare_speedtest(
 }
 
 async fn run_download_test(stream: Box<dyn http_codec::Stream>, n: u32) {
+    static CHUNK: Bytes = Bytes::from_static(&[0; CHUNK_SIZE]);
+
     let log_id = stream.id();
     log_id!(trace, log_id, "Running download test");
 
-    let response = http::Response::builder()
-        .status(http::StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/octet-stream")
-        .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(())
-        .unwrap()
-        .into_parts()
-        .0;
+    let mut response = http::Response::<()>::default().into_parts().0;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers.insert(
+        http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        http::HeaderValue::from_static("*"),
+    );
 
     // @fixme: when running over HTTP/3 response sending fails with `TransportError(FinalSize)`
     let mut sink = match stream.split().1.send_response(response, false) {
@@ -189,8 +191,6 @@ async fn run_download_test(stream: Box<dyn http_codec::Stream>, n: u32) {
             return;
         }
     };
-
-    static CHUNK: Bytes = Bytes::from_static(&[0; CHUNK_SIZE]);
 
     let mut n = n as usize;
     while n > 0 {
@@ -274,5 +274,68 @@ async fn run_upload_test(stream: Box<dyn http_codec::Stream>, n: u32) {
 
     if let Err(e) = respond.send_ok_response(true) {
         log_id!(debug, log_id, "Failed to respond request: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_paths_keep_base_prefix_and_size_limits() -> Result<(), Box<dyn std::error::Error>> {
+        for (path, base_path, megabytes) in [
+            ("/speed/1mb.bin", Some("/speed"), 1),
+            ("/speed/1mb.bin", Some("/speed/"), 1),
+            ("/speed1mb.bin", Some("/speed"), 1),
+            ("/1mb.bin", None, 1),
+            ("/1mb.bin", Some("/unused"), 1),
+            ("/speed/100mb.bin", Some("/speed"), MAX_DOWNLOAD_MB),
+        ] {
+            let request = http::Request::builder().uri(path).body(())?.into_parts().0;
+            if !matches!(prepare_speedtest(&request, base_path), Ok(Speedtest::Download(n)) if n == megabytes * 1024 * 1024)
+            {
+                return Err(format!(
+                    "Expected {megabytes}-megabyte download for {path:?} with base {base_path:?}"
+                )
+                .into());
+            }
+        }
+        for path in ["/speed/0mb.bin", "/speed/101mb.bin", "/speed/upload.html"] {
+            let request = http::Request::builder().uri(path).body(())?.into_parts().0;
+            if prepare_speedtest(&request, Some("/speed")).is_ok() {
+                return Err(format!("Expected download path {path:?} to be rejected").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uploads_require_positive_bounded_content_length() -> Result<(), Box<dyn std::error::Error>> {
+        for length in [
+            0,
+            1,
+            MAX_UPLOAD_MB * 1024 * 1024,
+            MAX_UPLOAD_MB * 1024 * 1024 + 1,
+        ] {
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("/upload.html")
+                .header(http::header::CONTENT_LENGTH, length)
+                .body(())?
+                .into_parts()
+                .0;
+            let result = prepare_speedtest(&request, None);
+            if length > 0 && length <= MAX_UPLOAD_MB * 1024 * 1024 {
+                if !matches!(result, Ok(Speedtest::Upload(n)) if n == length) {
+                    return Err(format!(
+                        "Expected upload length {length} to be accepted unchanged"
+                    )
+                    .into());
+                }
+            } else if result.is_ok() {
+                return Err(format!("Expected upload length {length} to be rejected").into());
+            }
+        }
+        Ok(())
     }
 }

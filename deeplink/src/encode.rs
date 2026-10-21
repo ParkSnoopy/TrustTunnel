@@ -44,7 +44,12 @@ fn encode_base64url(payload: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(payload)
 }
 
-/// Encode a DeepLinkConfig into TLV binary payload.
+/// Encode a `DeepLinkConfig` into TLV binary payload.
+///
+/// # Errors
+///
+/// Returns [`crate::DeepLinkError`] if configuration validation fails or a
+/// field length exceeds the variable-length integer range.
 pub fn encode_tlv_payload(config: &DeepLinkConfig) -> Result<Vec<u8>> {
     config.validate()?;
 
@@ -143,79 +148,87 @@ pub fn encode_tlv_payload(config: &DeepLinkConfig) -> Result<Vec<u8>> {
 pub fn encode(config: &DeepLinkConfig) -> Result<String> {
     let payload = encode_tlv_payload(config)?;
     let encoded = encode_base64url(&payload);
-    Ok(format!("{PREFIX}{}", encoded))
+    Ok(format!("{PREFIX}{encoded}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::{prop_assert, prop_assert_eq, prop_assert_ne};
+
+    type TestResult = proptest::test_runner::TestCaseResult;
 
     #[test]
-    fn test_encode_tlv() {
-        let result = encode_tlv(TlvTag::Hostname, b"example.com").unwrap();
-        assert_eq!(result[0], 0x01); // tag
-        assert_eq!(result[1], 11); // length
-        assert_eq!(&result[2..], b"example.com");
+    fn test_encode_tlv() -> TestResult {
+        let result = encode_tlv(TlvTag::Hostname, b"example.com")?;
+        prop_assert_eq!(result[0], 0x01); // tag
+        prop_assert_eq!(result[1], 11); // length
+        prop_assert_eq!(&result[2..], b"example.com");
+        Ok(())
     }
 
     #[test]
-    fn test_encode_string_field() {
-        let result = encode_string_field(TlvTag::Username, "alice").unwrap();
-        assert_eq!(result[0], 0x05); // Username tag
-        assert_eq!(result[1], 5); // length
-        assert_eq!(&result[2..], b"alice");
+    fn test_encode_string_field() -> TestResult {
+        let result = encode_string_field(TlvTag::Username, "alice")?;
+        prop_assert_eq!(result[0], 0x05); // Username tag
+        prop_assert_eq!(result[1], 5); // length
+        prop_assert_eq!(&result[2..], b"alice");
+        Ok(())
     }
 
     #[test]
-    fn test_encode_bool_field() {
-        let result_true = encode_bool_field(TlvTag::HasIpv6, true).unwrap();
-        assert_eq!(result_true[0], 0x04); // HasIpv6 tag
-        assert_eq!(result_true[1], 1); // length
-        assert_eq!(result_true[2], 0x01); // true
+    fn test_encode_bool_field() -> TestResult {
+        let result_true = encode_bool_field(TlvTag::HasIpv6, true)?;
+        prop_assert_eq!(result_true[0], 0x04); // HasIpv6 tag
+        prop_assert_eq!(result_true[1], 1); // length
+        prop_assert_eq!(result_true[2], 0x01); // true
 
-        let result_false = encode_bool_field(TlvTag::SkipVerification, false).unwrap();
-        assert_eq!(result_false[0], 0x07); // SkipVerification tag
-        assert_eq!(result_false[1], 1); // length
-        assert_eq!(result_false[2], 0x00); // false
+        let result_false = encode_bool_field(TlvTag::SkipVerification, false)?;
+        prop_assert_eq!(result_false[0], 0x07); // SkipVerification tag
+        prop_assert_eq!(result_false[1], 1); // length
+        prop_assert_eq!(result_false[2], 0x00); // false
+        Ok(())
     }
 
     #[test]
-    fn test_encode_protocol_field() {
-        let result_http2 = encode_protocol_field(Protocol::Http2).unwrap();
-        assert_eq!(result_http2[0], 0x09); // UpstreamProtocol tag
-        assert_eq!(result_http2[1], 1); // length
-        assert_eq!(result_http2[2], 0x01); // http2
+    fn test_encode_protocol_field() -> TestResult {
+        let result_http2 = encode_protocol_field(Protocol::Http2)?;
+        prop_assert_eq!(result_http2[0], 0x09); // UpstreamProtocol tag
+        prop_assert_eq!(result_http2[1], 1); // length
+        prop_assert_eq!(result_http2[2], 0x01); // http2
 
-        let result_http3 = encode_protocol_field(Protocol::Http3).unwrap();
-        assert_eq!(result_http3[2], 0x02); // http3
+        let result_http3 = encode_protocol_field(Protocol::Http3)?;
+        prop_assert_eq!(result_http3[2], 0x02); // http3
+        Ok(())
     }
 
     #[test]
-    fn test_encode_base64url() {
+    fn test_encode_base64url() -> TestResult {
         let data = b"hello world";
         let encoded = encode_base64url(data);
-        assert_eq!(encoded, "aGVsbG8gd29ybGQ");
-        assert!(!encoded.contains('='));
+        prop_assert_eq!(encoded.as_str(), "aGVsbG8gd29ybGQ");
+        prop_assert!(!encoded.contains('='));
+        Ok(())
     }
 
     #[test]
-    fn test_encode_tlv_payload_minimal() {
+    fn test_encode_tlv_payload_minimal() -> TestResult {
         let config = DeepLinkConfig::builder()
             .hostname("vpn.example.com".to_string())
             .addresses(vec!["1.2.3.4:443".to_string()])
             .username("alice".to_string())
             .password("secret".to_string())
-            .build()
-            .unwrap();
+            .build()?;
 
-        let payload = encode_tlv_payload(&config).unwrap();
+        let payload = encode_tlv_payload(&config)?;
 
         // Should contain required fields only (has_ipv6=true is default, so omitted)
-        assert!(!payload.is_empty());
+        prop_assert_ne!(payload, Vec::<u8>::new());
+        Ok(())
     }
 
     #[test]
-    fn test_encode_tlv_payload_with_optional_fields() {
+    fn test_encode_tlv_payload_with_optional_fields() -> TestResult {
         let config = DeepLinkConfig::builder()
             .hostname("vpn.example.com".to_string())
             .addresses(vec!["1.2.3.4:443".to_string()])
@@ -226,58 +239,58 @@ mod tests {
             .skip_verification(true)
             .upstream_protocol(Protocol::Http3)
             .anti_dpi(true)
-            .build()
-            .unwrap();
+            .build()?;
 
-        let payload = encode_tlv_payload(&config).unwrap();
+        let payload = encode_tlv_payload(&config)?;
 
         // Should contain all fields
-        assert!(!payload.is_empty());
+        prop_assert_ne!(payload, Vec::<u8>::new());
+        Ok(())
     }
 
     #[test]
-    fn test_encode_full_uri() {
+    fn test_encode_full_uri() -> TestResult {
         let config = DeepLinkConfig::builder()
             .hostname("vpn.example.com".to_string())
             .addresses(vec!["1.2.3.4:443".to_string()])
             .username("alice".to_string())
             .password("secret".to_string())
-            .build()
-            .unwrap();
+            .build()?;
 
-        let uri = encode(&config).unwrap();
+        let uri = encode(&config)?;
 
-        assert!(uri.starts_with(PREFIX));
-        assert!(!uri.contains('='));
+        prop_assert!(uri.starts_with(PREFIX));
+        prop_assert!(!uri.contains('='));
+        Ok(())
     }
 
     #[test]
-    fn test_encode_tlv_payload_subscription_only() {
+    fn test_encode_tlv_payload_subscription_only() -> TestResult {
         let url = "https://alice:s3cret@vpn.example.com/subscription";
         let config = DeepLinkConfig::builder()
             .subscription_url(Some(url.to_string()))
-            .build()
-            .unwrap();
+            .build()?;
 
-        let payload = encode_tlv_payload(&config).unwrap();
+        let payload = encode_tlv_payload(&config)?;
 
         // Version-2 TLV (tag 0x00, len 1, value 2) comes first.
-        assert_eq!(&payload[..3], &[0x00, 0x01, 0x02]);
+        prop_assert_eq!(&payload[..3], &[0x00, 0x01, 0x02]);
 
         // The whole payload is exactly these two TLVs; anything appended
         // afterwards (e.g. a new default-emitted field) fails here.
         let mut tags = Vec::new();
         let mut offset = 0;
         while offset < payload.len() {
-            let (tag, after_tag) = crate::varint::decode_varint(&payload, offset).unwrap();
-            let (len, after_len) = crate::varint::decode_varint(&payload, after_tag).unwrap();
+            let (tag, after_tag) = crate::varint::decode_varint(&payload, offset)?;
+            let (len, after_len) = crate::varint::decode_varint(&payload, after_tag)?;
             tags.push(TlvTag::from_u8(tag as u8));
             offset = after_len + len as usize;
         }
-        assert_eq!(tags, [Some(TlvTag::Version), Some(TlvTag::SubscriptionUrl)]);
+        prop_assert_eq!(tags, [Some(TlvTag::Version), Some(TlvTag::SubscriptionUrl)]);
 
-        let decoded = crate::decode::decode_tlv_payload(&payload).unwrap();
-        assert_eq!(decoded.subscription_url.as_deref(), Some(url));
-        assert_eq!(decoded.hostname, None);
+        let decoded = crate::decode::decode_tlv_payload(&payload)?;
+        prop_assert_eq!(decoded.subscription_url.as_deref(), Some(url));
+        prop_assert_eq!(decoded.hostname, None);
+        Ok(())
     }
 }

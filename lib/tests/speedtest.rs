@@ -1,30 +1,41 @@
+//! Speed-test uploads and downloads over every supported transport.
+
 use http::Request;
 use std::net::SocketAddr;
 use std::time::Duration;
 use trusttunnel::net_utils;
 
-#[allow(dead_code)]
 mod common;
+use common::TestResult;
+#[path = "common/endpoint.rs"]
+mod endpoint;
+#[path = "common/http_get.rs"]
+mod http_get;
+#[path = "common/http_post.rs"]
+mod http_post;
+#[path = "common/quic.rs"]
+pub mod quic;
 
 macro_rules! download_tests {
     ($($name:ident: $client_fn:expr, $body_size_mb:expr,)*) => {
     $(
         #[tokio::test]
-        async fn $name() {
-            common::set_up_logger();
+        async fn $name() -> TestResult {
+            common::set_up_logger()?;
             let endpoint_address = common::make_endpoint_address();
 
             let client_task = async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let (status, body_size) = $client_fn(&endpoint_address, $body_size_mb).await;
-                assert_eq!(status, http::StatusCode::OK);
-                assert_eq!(body_size, $body_size_mb * 1024 * 1024);
+                let (status, body_size) = $client_fn(&endpoint_address, $body_size_mb).await?;
+                common::check(status == http::StatusCode::OK, "assertion failed: status == http::StatusCode::OK")?;
+                common::check(body_size == $body_size_mb * 1024 * 1024, "assertion failed: body_size == $body_size_mb * 1024 * 1024")?;
+                Ok::<(), common::TestError>(())
             };
 
             tokio::select! {
-                _ = common::run_endpoint(&endpoint_address) => unreachable!(),
-                _ = client_task => (),
-                _ = tokio::time::sleep(Duration::from_secs(20)) => panic!("Timed out"),
+                result = endpoint::run_endpoint(&endpoint_address) => result,
+                result = client_task => result,
+                () = tokio::time::sleep(Duration::from_secs(20)) => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
             }
         }
     )*
@@ -35,20 +46,21 @@ macro_rules! upload_tests {
     ($($name:ident: $client_fn:expr, $body_size_mb:expr,)*) => {
     $(
         #[tokio::test]
-        async fn $name() {
-            common::set_up_logger();
+        async fn $name() -> TestResult {
+            common::set_up_logger()?;
             let endpoint_address = common::make_endpoint_address();
 
             let client_task = async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let status = $client_fn(&endpoint_address, $body_size_mb * 1024 * 1024).await;
-                assert_eq!(status, http::StatusCode::OK);
+                let status = $client_fn(&endpoint_address, $body_size_mb * 1024 * 1024).await?;
+                common::check(status == http::StatusCode::OK, "assertion failed: status == http::StatusCode::OK")?;
+                Ok::<(), common::TestError>(())
             };
 
             tokio::select! {
-                _ = common::run_endpoint(&endpoint_address) => unreachable!(),
-                _ = client_task => (),
-                _ = tokio::time::sleep(Duration::from_secs(20)) => panic!("Timed out"),
+                result = endpoint::run_endpoint(&endpoint_address) => result,
+                result = client_task => result,
+                () = tokio::time::sleep(Duration::from_secs(20)) => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
             }
         }
     )*
@@ -76,166 +88,161 @@ upload_tests! {
 async fn sni_h1_download_client(
     endpoint_address: &SocketAddr,
     body_size_mb: usize,
-) -> (http::StatusCode, usize) {
+) -> TestResult<(http::StatusCode, usize)> {
     let stream = common::establish_tls_connection(
         &format!("speed.{}", common::MAIN_DOMAIN_NAME),
         endpoint_address,
         None,
     )
-    .await;
+    .await?;
 
-    let (response, body) = common::do_get_request(
+    let (response, body) = http_get::do_get_request(
         stream,
         http::Version::HTTP_11,
         &format!(
-            "https://speed.{}:{}/{}mb.bin",
+            "https://speed.{}:{}/{body_size_mb}mb.bin",
             common::MAIN_DOMAIN_NAME,
-            endpoint_address.port(),
-            body_size_mb
+            endpoint_address.port()
         ),
         &[],
     )
-    .await;
+    .await?;
 
-    (response.status, body.len())
+    Ok((response.status, body.len()))
 }
 
 async fn sni_h2_download_client(
     endpoint_address: &SocketAddr,
     body_size_mb: usize,
-) -> (http::StatusCode, usize) {
+) -> TestResult<(http::StatusCode, usize)> {
     let stream = common::establish_tls_connection(
         &format!("speed.{}", common::MAIN_DOMAIN_NAME),
         endpoint_address,
         Some(net_utils::HTTP2_ALPN.as_bytes()),
     )
-    .await;
+    .await?;
 
-    let (response, body) = common::do_get_request(
+    let (response, body) = http_get::do_get_request(
         stream,
         http::Version::HTTP_2,
         &format!(
-            "https://speed.{}:{}/{}mb.bin",
+            "https://speed.{}:{}/{body_size_mb}mb.bin",
             common::MAIN_DOMAIN_NAME,
-            endpoint_address.port(),
-            body_size_mb
+            endpoint_address.port()
         ),
         &[],
     )
-    .await;
+    .await?;
 
-    (response.status, body.len())
+    Ok((response.status, body.len()))
 }
 
 async fn sni_h3_download_client(
     endpoint_address: &SocketAddr,
     body_size_mb: usize,
-) -> (http::StatusCode, usize) {
-    let mut conn = common::Http3Session::connect(
+) -> TestResult<(http::StatusCode, usize)> {
+    let mut conn = quic::Http3Session::connect(
         endpoint_address,
         &format!("speed.{}", common::MAIN_DOMAIN_NAME),
         None,
     )
-    .await;
+    .await?;
 
     let (response, content) = conn
         .exchange(
-            Request::get(&format!(
-                "https://{}:{}/speed/{}mb.bin",
+            Request::get(format!(
+                "https://{}:{}/speed/{body_size_mb}mb.bin",
                 common::MAIN_DOMAIN_NAME,
-                endpoint_address.port(),
-                body_size_mb
+                endpoint_address.port()
             ))
-            .body(hyper::Body::empty())
-            .unwrap(),
+            .body(hyper::Body::empty())?,
         )
-        .await;
+        .await?;
 
-    (response.status, content.len())
+    Ok((response.status, content.len()))
 }
 
 async fn path_h1_download_client(
     endpoint_address: &SocketAddr,
     body_size_mb: usize,
-) -> (http::StatusCode, usize) {
+) -> TestResult<(http::StatusCode, usize)> {
     let stream =
-        common::establish_tls_connection(common::MAIN_DOMAIN_NAME, endpoint_address, None).await;
+        common::establish_tls_connection(common::MAIN_DOMAIN_NAME, endpoint_address, None).await?;
 
-    let (response, body) = common::do_get_request(
+    let (response, body) = http_get::do_get_request(
         stream,
         http::Version::HTTP_11,
         &format!(
-            "https://{}:{}/speed/{}mb.bin",
+            "https://{}:{}/speed/{body_size_mb}mb.bin",
             common::MAIN_DOMAIN_NAME,
-            endpoint_address.port(),
-            body_size_mb
+            endpoint_address.port()
         ),
         &[],
     )
-    .await;
+    .await?;
 
-    (response.status, body.len())
+    Ok((response.status, body.len()))
 }
 
 async fn path_h2_download_client(
     endpoint_address: &SocketAddr,
     body_size_mb: usize,
-) -> (http::StatusCode, usize) {
+) -> TestResult<(http::StatusCode, usize)> {
     let stream = common::establish_tls_connection(
         common::MAIN_DOMAIN_NAME,
         endpoint_address,
         Some(net_utils::HTTP2_ALPN.as_bytes()),
     )
-    .await;
+    .await?;
 
-    let (response, body) = common::do_get_request(
+    let (response, body) = http_get::do_get_request(
         stream,
         http::Version::HTTP_2,
         &format!(
-            "https://{}:{}/speed/{}mb.bin",
+            "https://{}:{}/speed/{body_size_mb}mb.bin",
             common::MAIN_DOMAIN_NAME,
-            endpoint_address.port(),
-            body_size_mb
+            endpoint_address.port()
         ),
         &[],
     )
-    .await;
+    .await?;
 
-    (response.status, body.len())
+    Ok((response.status, body.len()))
 }
 
 async fn path_h3_download_client(
     endpoint_address: &SocketAddr,
     body_size_mb: usize,
-) -> (http::StatusCode, usize) {
+) -> TestResult<(http::StatusCode, usize)> {
     let mut conn =
-        common::Http3Session::connect(endpoint_address, common::MAIN_DOMAIN_NAME, None).await;
+        quic::Http3Session::connect(endpoint_address, common::MAIN_DOMAIN_NAME, None).await?;
 
     let (response, content) = conn
         .exchange(
-            Request::get(&format!(
-                "https://{}:{}/speed/{}mb.bin",
+            Request::get(format!(
+                "https://{}:{}/speed/{body_size_mb}mb.bin",
                 common::MAIN_DOMAIN_NAME,
-                endpoint_address.port(),
-                body_size_mb
+                endpoint_address.port()
             ))
-            .body(hyper::Body::empty())
-            .unwrap(),
+            .body(hyper::Body::empty())?,
         )
-        .await;
+        .await?;
 
-    (response.status, content.len())
+    Ok((response.status, content.len()))
 }
 
-async fn sni_h1_upload_client(endpoint_address: &SocketAddr, body_size: usize) -> http::StatusCode {
+async fn sni_h1_upload_client(
+    endpoint_address: &SocketAddr,
+    body_size: usize,
+) -> TestResult<http::StatusCode> {
     let stream = common::establish_tls_connection(
         &format!("speed.{}", common::MAIN_DOMAIN_NAME),
         endpoint_address,
         None,
     )
-    .await;
+    .await?;
 
-    common::do_post_request(
+    Ok(http_post::do_post_request(
         stream,
         http::Version::HTTP_11,
         &format!(
@@ -245,19 +252,22 @@ async fn sni_h1_upload_client(endpoint_address: &SocketAddr, body_size: usize) -
         ),
         body_size,
     )
-    .await
-    .status()
+    .await?
+    .status())
 }
 
-async fn sni_h2_upload_client(endpoint_address: &SocketAddr, body_size: usize) -> http::StatusCode {
+async fn sni_h2_upload_client(
+    endpoint_address: &SocketAddr,
+    body_size: usize,
+) -> TestResult<http::StatusCode> {
     let stream = common::establish_tls_connection(
         &format!("speed.{}", common::MAIN_DOMAIN_NAME),
         endpoint_address,
         Some(net_utils::HTTP2_ALPN.as_bytes()),
     )
-    .await;
+    .await?;
 
-    common::do_post_request(
+    Ok(http_post::do_post_request(
         stream,
         http::Version::HTTP_2,
         &format!(
@@ -267,40 +277,42 @@ async fn sni_h2_upload_client(endpoint_address: &SocketAddr, body_size: usize) -
         ),
         body_size,
     )
-    .await
-    .status()
+    .await?
+    .status())
 }
 
-async fn sni_h3_upload_client(endpoint_address: &SocketAddr, body_size: usize) -> http::StatusCode {
-    let mut conn = common::Http3Session::connect(
+async fn sni_h3_upload_client(
+    endpoint_address: &SocketAddr,
+    body_size: usize,
+) -> TestResult<http::StatusCode> {
+    let mut conn = quic::Http3Session::connect(
         endpoint_address,
         &format!("speed.{}", common::MAIN_DOMAIN_NAME),
         None,
     )
-    .await;
+    .await?;
     conn.send_request(
-        Request::post(&format!(
+        Request::post(format!(
             "https://speed.{}:{}/upload.html",
             common::MAIN_DOMAIN_NAME,
             endpoint_address.port()
         ))
         .header(http::header::CONTENT_LENGTH, body_size.to_string())
-        .body(hyper::Body::from(vec![0; body_size]))
-        .unwrap(),
+        .body(hyper::Body::from(vec![0; body_size]))?,
     )
-    .await;
+    .await?;
 
-    conn.recv_response().await.status
+    Ok(conn.recv_response().await?.status)
 }
 
 async fn path_h1_upload_client(
     endpoint_address: &SocketAddr,
     body_size: usize,
-) -> http::StatusCode {
+) -> TestResult<http::StatusCode> {
     let stream =
-        common::establish_tls_connection(common::MAIN_DOMAIN_NAME, endpoint_address, None).await;
+        common::establish_tls_connection(common::MAIN_DOMAIN_NAME, endpoint_address, None).await?;
 
-    common::do_post_request(
+    Ok(http_post::do_post_request(
         stream,
         http::Version::HTTP_11,
         &format!(
@@ -310,22 +322,22 @@ async fn path_h1_upload_client(
         ),
         body_size,
     )
-    .await
-    .status()
+    .await?
+    .status())
 }
 
 async fn path_h2_upload_client(
     endpoint_address: &SocketAddr,
     body_size: usize,
-) -> http::StatusCode {
+) -> TestResult<http::StatusCode> {
     let stream = common::establish_tls_connection(
         common::MAIN_DOMAIN_NAME,
         endpoint_address,
         Some(net_utils::HTTP2_ALPN.as_bytes()),
     )
-    .await;
+    .await?;
 
-    common::do_post_request(
+    Ok(http_post::do_post_request(
         stream,
         http::Version::HTTP_2,
         &format!(
@@ -335,27 +347,26 @@ async fn path_h2_upload_client(
         ),
         body_size,
     )
-    .await
-    .status()
+    .await?
+    .status())
 }
 
 async fn path_h3_upload_client(
     endpoint_address: &SocketAddr,
     body_size: usize,
-) -> http::StatusCode {
+) -> TestResult<http::StatusCode> {
     let mut conn =
-        common::Http3Session::connect(endpoint_address, common::MAIN_DOMAIN_NAME, None).await;
+        quic::Http3Session::connect(endpoint_address, common::MAIN_DOMAIN_NAME, None).await?;
     conn.send_request(
-        Request::post(&format!(
+        Request::post(format!(
             "https://{}:{}/speed/upload.html",
             common::MAIN_DOMAIN_NAME,
             endpoint_address.port()
         ))
         .header(http::header::CONTENT_LENGTH, body_size.to_string())
-        .body(hyper::Body::from(vec![0; body_size]))
-        .unwrap(),
+        .body(hyper::Body::from(vec![0; body_size]))?,
     )
-    .await;
+    .await?;
 
-    conn.recv_response().await.status
+    Ok(conn.recv_response().await?.status)
 }

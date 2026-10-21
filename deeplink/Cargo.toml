@@ -1,10 +1,13 @@
 [package]
 name = "trusttunnel-deeplink"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 authors = ["AdGuard"]
 description = "Deep-link URI encoding and decoding for TrustTunnel configurations"
-repository = "https://github.com/TrustTunnel/TrustTunnel"
+repository.workspace = true
+license.workspace = true
+keywords = ["vpn", "deeplink", "trusttunnel"]
+categories = ["encoding", "network-programming"]
 
 [dependencies]
 base64 = "0.21"

@@ -4,14 +4,14 @@ use futures::future;
 use std::fmt::Debug;
 use std::io;
 
-pub(crate) trait Datagram {
+pub trait Datagram {
     /// Get on-the-wire length of the datagram
     fn len(&self) -> usize;
 }
 
 /// An abstract interface for a datagram receiver implementation
 #[async_trait]
-pub(crate) trait Source: Send {
+pub trait Source: Send {
     type Output;
 
     fn id(&self) -> log_utils::IdChain<u64>;
@@ -20,7 +20,7 @@ pub(crate) trait Source: Send {
     async fn read(&mut self) -> io::Result<Self::Output>;
 }
 
-pub(crate) enum SendStatus {
+pub enum SendStatus {
     /// A sink sent the full chunk successfully
     Sent,
     /// A sink did not send anything as it is not able to send the full chunk at the moment
@@ -30,7 +30,7 @@ pub(crate) enum SendStatus {
 
 /// An abstract interface for a datagram transmitter implementation
 #[async_trait]
-pub(crate) trait Sink: Send {
+pub trait Sink: Send {
     type Input;
 
     /// Send a data chunk to the peer.
@@ -43,19 +43,25 @@ pub(crate) trait Sink: Send {
 
 /// An abstract interface for a two-way datagram channel implementation
 #[async_trait]
-pub(crate) trait DuplexPipe: Send {
+pub trait DuplexPipe: Send {
     /// Exchange datagrams until some error happened or the channel is closed
     async fn exchange(&mut self) -> io::Result<()>;
 }
 
-pub(crate) struct GenericSimplexPipe<D, F> {
+pub struct GenericSimplexPipe<D, F> {
     direction: pipe::SimplexDirection,
     source: Box<dyn Source<Output = D>>,
     sink: Box<dyn Sink<Input = D>>,
     update_metrics: F,
 }
 
-pub(crate) struct GenericDuplexPipe<D1, D2, F> {
+type SimplexParts<D> = (
+    pipe::SimplexDirection,
+    Box<dyn Source<Output = D>>,
+    Box<dyn Sink<Input = D>>,
+);
+
+pub struct GenericDuplexPipe<D1, D2, F> {
     left_pipe: GenericSimplexPipe<D1, F>,
     right_pipe: GenericSimplexPipe<D2, F>,
 }
@@ -67,16 +73,8 @@ where
     F: Fn(pipe::SimplexDirection, usize) + Send + Clone,
 {
     pub fn new(
-        (dir1, source1, sink1): (
-            pipe::SimplexDirection,
-            Box<dyn Source<Output = D1>>,
-            Box<dyn Sink<Input = D1>>,
-        ),
-        (dir2, source2, sink2): (
-            pipe::SimplexDirection,
-            Box<dyn Source<Output = D2>>,
-            Box<dyn Sink<Input = D2>>,
-        ),
+        (dir1, source1, sink1): SimplexParts<D1>,
+        (dir2, source2, sink2): SimplexParts<D2>,
         update_metrics: F,
     ) -> Self {
         Self {
@@ -100,7 +98,7 @@ where
         futures::pin_mut!(right);
         match future::try_select(left, right).await {
             Ok(_) => Ok(()),
-            Err(future::Either::Left((e, _))) | Err(future::Either::Right((e, _))) => Err(e),
+            Err(future::Either::Left((e, _)) | future::Either::Right((e, _))) => Err(e),
         }
     }
 }

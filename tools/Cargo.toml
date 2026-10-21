@@ -1,8 +1,13 @@
 [package]
 name = "trusttunnel_endpoint_tools"
-version = "0.1.0"
-authors = ["Sergei Gunchenko <s.gunchenko@adguard.com>"]
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Configuration and certificate setup wizard for TrustTunnel"
+license.workspace = true
+repository.workspace = true
+keywords = ["vpn", "configuration", "trusttunnel"]
+categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "setup_wizard"

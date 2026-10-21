@@ -1616,6 +1616,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases 0.2.2",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3517,7 +3518,6 @@ dependencies = [
  "base64 0.21.7",
  "boring",
  "bytes",
- "cc",
  "chrono",
  "dynfmt",
  "futures",
@@ -3531,6 +3531,7 @@ dependencies = [
  "libc",
  "log",
  "macros",
+ "nix 0.31.3",
  "once_cell",
  "prometheus",
  "quiche",

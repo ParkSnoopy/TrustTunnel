@@ -1,7 +1,12 @@
 [package]
 name = "trusttunnel_endpoint"
-authors = ["Sergei Gunchenko <s.gunchenko@adguard.com>"]
-edition = "2021"
+authors.workspace = true
+edition.workspace = true
+description = "HTTPS-compatible TrustTunnel VPN endpoint"
+license.workspace = true
+repository.workspace = true
+keywords = ["vpn", "https", "trusttunnel"]
+categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "trusttunnel_endpoint"

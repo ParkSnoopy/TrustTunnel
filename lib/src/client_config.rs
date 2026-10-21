@@ -1,3 +1,5 @@
+//! Client configuration and subscription-link exports.
+
 use crate::{
     authentication::registry_based, cert_verification::CertificateVerifier,
     settings::TlsHostsSettings, utils::ToTomlComment,
@@ -5,20 +7,26 @@ use crate::{
 #[cfg(feature = "rt_doc")]
 use macros::{Getter, RuntimeDoc};
 use once_cell::sync::Lazy;
+use std::io;
 use toml_edit::{value, Document};
 
 /// Percent-encode a username/password for the `userinfo` component of a URL
 /// per RFC 3986. Encodes any byte outside the unreserved set `A-Za-z0-9-._~`.
 fn percent_encode_userinfo(s: &str) -> String {
-    fn is_unreserved(b: u8) -> bool {
+    const fn is_unreserved(b: u8) -> bool {
         b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
     }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         if is_unreserved(b) {
-            out.push(b as char);
+            out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{:02X}", b));
+            out.extend([
+                '%',
+                char::from(HEX[usize::from(b >> 4)]),
+                char::from(HEX[usize::from(b & 0x0f)]),
+            ]);
         }
     }
     out
@@ -37,6 +45,7 @@ fn split_authority(url: &str) -> (&str, &str) {
 /// `base` is `https://<host><path>` (optionally overridden via `--subscription-url`,
 /// in which case any embedded userinfo is stripped). Credentials are always
 /// appended and percent-encoded.
+#[must_use]
 pub fn build_subscription_url(base: &str, username: &str, password: &str) -> String {
     let rest = base.strip_prefix("https://").unwrap_or(base);
     // Strip userinfo only from the authority part: a '@' in the path or query
@@ -60,6 +69,9 @@ pub fn build_subscription_url(base: &str, username: &str, password: &str) -> Str
 /// override carrying `user:pass@` is rejected to surface the misuse rather than
 /// silently stripping it. A `@` outside the authority (i.e. in the path or
 /// query) is left alone.
+///
+/// # Errors
+/// Returns an error for a non-HTTPS URL, missing host, or embedded credentials.
 pub fn validate_subscription_url_override(url: &str) -> Result<(), String> {
     let rest = url
         .strip_prefix("https://")
@@ -77,67 +89,97 @@ pub fn validate_subscription_url_override(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Derive the port for the subscription URL from the `[subscription] address`
-/// value. Returns `None` — the port is omitted from the URL — when `address`
+/// Derive the subscription URL port from `[subscription] address`.
+///
+/// Returns `None` — the port is omitted from the URL — when `address`
 /// is `None`, carries no valid non-zero port, or the port is the HTTPS
 /// default (443).
+#[must_use]
 pub fn subscription_url_port(address: Option<&str>) -> Option<u16> {
     let port: u16 = address?.rsplit_once(':')?.1.parse().ok()?;
     (port != 0 && port != 443).then_some(port)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn build(
-    client: &String,
-    addresses: Vec<String>,
-    username: &[registry_based::Client],
-    hostsettings: &TlsHostsSettings,
-    custom_sni: Option<String>,
-    client_random_prefix: Option<String>,
-    client_random_auth_key: Option<String>,
-    name: Option<String>,
-    dns_upstreams: Vec<String>,
-    subscription_url: Option<String>,
-) -> ClientConfig {
-    let user = username
-        .iter()
-        .find(|x| x.username == *client)
-        .expect("There is no user config for specified username");
+/// Optional values included in an exported client configuration.
+#[derive(Default)]
+pub struct BuildOptions {
+    /// Custom TLS server name.
+    pub custom_sni: Option<String>,
+    /// Client-random prefix and optional mask.
+    pub client_random_prefix: Option<String>,
+    /// Auth key used to derive the TLS client random.
+    pub client_random_auth_key: Option<String>,
+    /// Human-readable endpoint label.
+    pub name: Option<String>,
+    /// Suggested DNS upstreams.
+    pub dns_upstreams: Vec<String>,
+    /// Subscription URL including the client's encoded credentials.
+    pub subscription_url: Option<String>,
+}
 
-    let host = hostsettings
-        .main_hosts
-        .first()
-        .expect("Can't find main host inside hosts config");
-
-    let certificate =
-        std::fs::read_to_string(&host.cert_chain_path).expect("Failed to load certificate");
-
-    // Check if certificate is system-verifiable
-    let cert_is_system_verifiable = CertificateVerifier::new()
-        .ok()
-        .map(|verifier| verifier.is_system_verifiable(&host.cert_chain_path, &host.hostname))
-        .unwrap_or(false);
-
-    ClientConfig {
-        hostname: host.hostname.clone(),
-        addresses,
-        custom_sni: custom_sni.unwrap_or_default(),
-        has_ipv6: true, // Hardcoded to true, client could change this himself
-        username: user.username.clone(),
-        password: user.password.clone(),
-        client_random_prefix: client_random_prefix.unwrap_or_default(),
-        client_random_auth_key: client_random_auth_key.unwrap_or_default(),
-        skip_verification: false,
-        certificate,
-        cert_is_system_verifiable,
-        upstream_protocol: "http2".into(),
-        anti_dpi: false,
-        name: name.unwrap_or_default(),
-        dns_upstreams,
-        subscription_url,
+impl std::fmt::Debug for BuildOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildOptions").finish_non_exhaustive()
     }
 }
 
+/// Build a client configuration from the selected client and main TLS host.
+///
+/// # Errors
+/// Returns an error if the client or host is absent or the certificate cannot be read.
+pub fn build(
+    client: &str,
+    addresses: Vec<String>,
+    username: &[registry_based::Client],
+    hostsettings: &TlsHostsSettings,
+    options: BuildOptions,
+) -> io::Result<ClientConfig> {
+    let user = username
+        .iter()
+        .find(|x| x.username == client)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "There is no user config for specified username",
+            )
+        })?;
+
+    let host = hostsettings.main_hosts.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Can't find main host inside hosts config",
+        )
+    })?;
+
+    let certificate = std::fs::read_to_string(&host.cert_chain_path)?;
+
+    // Check if certificate is system-verifiable
+    let cert_is_system_verifiable = CertificateVerifier::new()
+        .is_ok_and(|verifier| verifier.is_system_verifiable(&host.cert_chain_path, &host.hostname));
+
+    Ok(ClientConfig {
+        hostname: host.hostname.clone(),
+        addresses,
+        custom_sni: options.custom_sni.unwrap_or_default(),
+        has_ipv6: true, // Hardcoded to true, client could change this himself
+        username: user.username.clone(),
+        password: user.password.clone(),
+        client_random_prefix: options.client_random_prefix.unwrap_or_default(),
+        client_random_auth_key: options.client_random_auth_key.unwrap_or_default(),
+        skip_verification: false,
+        server_certificate: ClientCertificate {
+            pem: certificate,
+            system_verifiable: cert_is_system_verifiable,
+        },
+        upstream_protocol: "http2".into(),
+        anti_dpi: false,
+        name: options.name.unwrap_or_default(),
+        dns_upstreams: options.dns_upstreams,
+        subscription_url: options.subscription_url,
+    })
+}
+
+/// Connection, authentication, and export settings for one client.
 #[cfg_attr(feature = "rt_doc", derive(Getter, RuntimeDoc))]
 pub struct ClientConfig {
     /// Endpoint host name, used for TLS session establishment
@@ -147,7 +189,7 @@ pub struct ClientConfig {
     /// Custom SNI value for TLS handshake.
     /// If set, this value is used as the TLS SNI instead of the hostname.
     custom_sni: String,
-    /// Whether IPv6 traffic can be routed through the endpoint
+    /// Whether `IPv6` traffic can be routed through the endpoint
     has_ipv6: bool,
     /// Username for authorization
     username: String,
@@ -156,17 +198,14 @@ pub struct ClientConfig {
     /// TLS client random hex prefix for connection filtering.
     /// Must have a corresponding rule in rules.toml.
     client_random_prefix: String,
-    /// TLS client random auth key (hex string for HKDF+AES client_random derivation).
-    /// Must have a corresponding rule with client_random_auth_key in rules.toml.
+    /// TLS client random auth key (hex string for HKDF+AES `client_random` derivation).
+    /// Must have a corresponding rule with `client_random_auth_key` in rules.toml.
     client_random_auth_key: String,
     /// Skip the endpoint certificate verification?
     /// That is, any certificate is accepted with this one set to true.
     skip_verification: bool,
-    /// Endpoint certificate in PEM format.
-    /// If not specified, the endpoint certificate is verified using the system storage.
-    certificate: String,
-    /// True if cert can be verified by system CAs (used to omit cert from deep-link)
-    cert_is_system_verifiable: bool,
+    /// Endpoint certificate and its system-trust result.
+    server_certificate: ClientCertificate,
     /// Protocol to be used to communicate with the endpoint [http2, http3]
     upstream_protocol: String,
     /// Is anti-DPI measures should be enabled
@@ -181,11 +220,53 @@ pub struct ClientConfig {
     subscription_url: Option<String>,
 }
 
+/// Endpoint certificate and its system-trust result for configuration exports.
+#[derive(Debug)]
+pub struct ClientCertificate {
+    pem: String,
+    system_verifiable: bool,
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("hostname", &self.hostname)
+            .field("addresses", &self.addresses)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ClientConfig {
+    /// Borrow the endpoint's PEM certificate.
+    #[must_use]
+    pub const fn get_certificate(&self) -> &String {
+        &self.server_certificate.pem
+    }
+
+    /// Borrow the certificate's system-trust result.
+    #[must_use]
+    pub const fn get_cert_is_system_verifiable(&self) -> &bool {
+        &self.server_certificate.system_verifiable
+    }
+
+    /// Return the certificate field documentation.
+    #[must_use]
+    pub const fn doc_certificate() -> &'static str {
+        "Endpoint certificate in PEM format.\nIf not specified, the endpoint certificate is verified using the system storage."
+    }
+
+    /// Return the certificate system-trust documentation.
+    #[must_use]
+    pub const fn doc_cert_is_system_verifiable() -> &'static str {
+        "True if cert can be verified by system CAs (used to omit cert from deep-link)"
+    }
+
+    /// Export this configuration as commented TOML.
+    #[must_use]
     pub fn compose_toml(&self) -> String {
-        let mut doc: Document = TEMPLATE.parse().unwrap();
+        let mut doc = TEMPLATE.clone();
         doc["hostname"] = value(&self.hostname);
-        let vec = toml_edit::Array::from_iter(self.addresses.iter().map(|x| x.as_str()));
+        let vec = toml_edit::Array::from_iter(self.addresses.iter().map(String::as_str));
         doc["addresses"] = value(vec);
         doc["custom_sni"] = value(&self.custom_sni);
         doc["has_ipv6"] = value(self.has_ipv6);
@@ -194,10 +275,10 @@ impl ClientConfig {
         doc["client_random_prefix"] = value(&self.client_random_prefix);
         doc["client_random_auth_key"] = value(&self.client_random_auth_key);
         doc["skip_verification"] = value(self.skip_verification);
-        if self.cert_is_system_verifiable {
+        if self.server_certificate.system_verifiable {
             doc["certificate"] = value("");
         } else {
-            doc["certificate"] = value(&self.certificate);
+            doc["certificate"] = value(&self.server_certificate.pem);
         }
         doc["upstream_protocol"] = value(&self.upstream_protocol);
         doc["anti_dpi"] = value(self.anti_dpi);
@@ -205,7 +286,7 @@ impl ClientConfig {
             doc["name"] = value(&self.name);
         }
         if !self.dns_upstreams.is_empty() {
-            let vec = toml_edit::Array::from_iter(self.dns_upstreams.iter().map(|x| x.as_str()));
+            let vec = toml_edit::Array::from_iter(self.dns_upstreams.iter().map(String::as_str));
             doc["dns_upstreams"] = value(vec);
         }
         if let Some(url) = self.subscription_url.as_ref() {
@@ -215,13 +296,18 @@ impl ClientConfig {
     }
 
     /// Generate a deep-link URI (tt://?) for this client configuration.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid certificate, protocol, or encoded configuration.
     pub fn compose_deeplink(&self) -> std::io::Result<String> {
         use trusttunnel_deeplink::{DeepLinkConfig, Protocol};
 
         // Convert certificate from PEM to DER if needed
-        let certificate = if !self.cert_is_system_verifiable && !self.certificate.is_empty() {
+        let certificate = if !self.server_certificate.system_verifiable
+            && !self.server_certificate.pem.is_empty()
+        {
             Some(
-                trusttunnel_deeplink::cert::pem_to_der(&self.certificate)
+                trusttunnel_deeplink::cert::pem_to_der(&self.server_certificate.pem)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
             )
         } else {
@@ -276,6 +362,9 @@ impl ClientConfig {
     /// Generate a subscription-only deep-link URI (format v2) containing just
     /// the subscription URL. Clients must fetch the subscription before they
     /// can connect; there are no static fallback parameters.
+    ///
+    /// # Errors
+    /// Returns an error if the subscription URL is absent or cannot be encoded.
     pub fn compose_deeplink_subscription_only(&self) -> std::io::Result<String> {
         let subscription_url = self.subscription_url.clone().ok_or_else(|| {
             std::io::Error::new(
@@ -294,7 +383,81 @@ impl ClientConfig {
     }
 }
 
-static TEMPLATE: Lazy<String> = Lazy::new(|| {
+macro_rules! client_doc {
+    ($method:ident) => {{
+        #[cfg(feature = "rt_doc")]
+        {
+            ClientConfig::$method()
+        }
+        #[cfg(not(feature = "rt_doc"))]
+        {
+            ""
+        }
+    }};
+}
+
+static TEMPLATE: Lazy<Document> = Lazy::new(|| {
+    let mut doc = Document::new();
+    let fields = [
+        ("hostname", value(""), client_doc!(doc_hostname)),
+        (
+            "addresses",
+            value(toml_edit::Array::new()),
+            client_doc!(doc_addresses),
+        ),
+        ("custom_sni", value(""), client_doc!(doc_custom_sni)),
+        ("has_ipv6", value(true), client_doc!(doc_has_ipv6)),
+        ("username", value(""), client_doc!(doc_username)),
+        ("password", value(""), client_doc!(doc_password)),
+        (
+            "client_random_prefix",
+            value(""),
+            client_doc!(doc_client_random_prefix),
+        ),
+        (
+            "client_random_auth_key",
+            value(""),
+            client_doc!(doc_client_random_auth_key),
+        ),
+        (
+            "skip_verification",
+            value(false),
+            client_doc!(doc_skip_verification),
+        ),
+        ("certificate", value(""), client_doc!(doc_certificate)),
+        (
+            "upstream_protocol",
+            value(""),
+            client_doc!(doc_upstream_protocol),
+        ),
+        ("anti_dpi", value(false), client_doc!(doc_anti_dpi)),
+        ("name", value(""), client_doc!(doc_name)),
+        (
+            "dns_upstreams",
+            value(toml_edit::Array::new()),
+            client_doc!(doc_dns_upstreams),
+        ),
+    ];
+    for (index, (name, value, comment)) in fields.into_iter().enumerate() {
+        let mut key = toml_edit::Key::new(name);
+        let header = if index == 0 {
+            "\n# This file was automatically generated by endpoint and could be used in vpn client.\n"
+        } else {
+            ""
+        };
+        let comment = match name {
+            "has_ipv6" | "client_random_auth_key" => comment.replace('`', ""),
+            _ => comment.to_owned(),
+        };
+        key.decor_mut()
+            .set_prefix(format!("{header}\n{}\n", comment.to_toml_comment()));
+        doc.as_table_mut().insert_formatted(&key, value);
+    }
+    doc
+});
+
+#[cfg(test)]
+static ORIGINAL_TEMPLATE: Lazy<String> = Lazy::new(|| {
     format!(
         r#"
 # This file was automatically generated by endpoint and could be used in vpn client.
@@ -341,20 +504,20 @@ name = ""
 {}
 dns_upstreams = []
 "#,
-        ClientConfig::doc_hostname().to_toml_comment(),
-        ClientConfig::doc_addresses().to_toml_comment(),
-        ClientConfig::doc_custom_sni().to_toml_comment(),
-        ClientConfig::doc_has_ipv6().to_toml_comment(),
-        ClientConfig::doc_username().to_toml_comment(),
-        ClientConfig::doc_password().to_toml_comment(),
-        ClientConfig::doc_client_random_prefix().to_toml_comment(),
-        ClientConfig::doc_client_random_auth_key().to_toml_comment(),
-        ClientConfig::doc_skip_verification().to_toml_comment(),
-        ClientConfig::doc_certificate().to_toml_comment(),
-        ClientConfig::doc_upstream_protocol().to_toml_comment(),
-        ClientConfig::doc_anti_dpi().to_toml_comment(),
-        ClientConfig::doc_name().to_toml_comment(),
-        ClientConfig::doc_dns_upstreams().to_toml_comment(),
+        client_doc!(doc_hostname).to_toml_comment(),
+        client_doc!(doc_addresses).to_toml_comment(),
+        client_doc!(doc_custom_sni).to_toml_comment(),
+        if cfg!(feature = "rt_doc") { "Whether IPv6 traffic can be routed through the endpoint" } else { "" }.to_toml_comment(),
+        client_doc!(doc_username).to_toml_comment(),
+        client_doc!(doc_password).to_toml_comment(),
+        client_doc!(doc_client_random_prefix).to_toml_comment(),
+        if cfg!(feature = "rt_doc") { "TLS client random auth key (hex string for HKDF+AES client_random derivation).\nMust have a corresponding rule with client_random_auth_key in rules.toml." } else { "" }.to_toml_comment(),
+        client_doc!(doc_skip_verification).to_toml_comment(),
+        client_doc!(doc_certificate).to_toml_comment(),
+        client_doc!(doc_upstream_protocol).to_toml_comment(),
+        client_doc!(doc_anti_dpi).to_toml_comment(),
+        client_doc!(doc_name).to_toml_comment(),
+        client_doc!(doc_dns_upstreams).to_toml_comment(),
     )
 });
 #[cfg(test)]
@@ -363,9 +526,9 @@ mod tests {
 
     impl ClientConfig {
         fn test_config(certificate: String, cert_is_system_verifiable: bool) -> Self {
-            ClientConfig {
+            Self {
                 hostname: "vpn.example.com".into(),
-                addresses: vec!["1.2.3.4:443".parse().unwrap()],
+                addresses: vec!["1.2.3.4:443".into()],
                 custom_sni: String::new(),
                 has_ipv6: true,
                 username: "alice".into(),
@@ -373,8 +536,10 @@ mod tests {
                 client_random_prefix: String::new(),
                 client_random_auth_key: String::new(),
                 skip_verification: false,
-                certificate,
-                cert_is_system_verifiable,
+                server_certificate: ClientCertificate {
+                    pem: certificate,
+                    system_verifiable: cert_is_system_verifiable,
+                },
                 upstream_protocol: "http2".into(),
                 anti_dpi: false,
                 name: String::new(),
@@ -425,66 +590,85 @@ omxU7kknZApM\n\
 -----END CERTIFICATE-----\n";
 
     #[test]
-    fn test_compose_toml_self_signed_cert_chain() {
+    fn test_compose_toml_self_signed_cert_chain() -> Result<(), Box<dyn std::error::Error>> {
         let config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), false);
         let toml_output = config.compose_toml();
 
-        let doc: Document = toml_output.parse().unwrap();
-        let cert_value = doc["certificate"].as_str().unwrap();
+        let doc: Document = toml_output.parse()?;
+        let cert_value = doc["certificate"].as_str().ok_or("missing TOML string")?;
 
-        assert!(
-            cert_value.contains("-----BEGIN CERTIFICATE-----"),
-            "TOML should contain certificate when not system-verifiable"
+        if !(cert_value.contains("-----BEGIN CERTIFICATE-----")) {
+            return Err("TOML should contain certificate when not system-verifiable".into());
+        }
+        let (actual, expected) = (
+            &(cert_value.matches("-----BEGIN CERTIFICATE-----").count()),
+            &(2),
         );
-        assert_eq!(
-            cert_value.matches("-----BEGIN CERTIFICATE-----").count(),
-            2,
-            "TOML should contain both certs from the chain"
-        );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "TOML should contain both certs from the chain"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_compose_toml_system_verifiable_cert_omitted() {
+    fn test_compose_toml_system_verifiable_cert_omitted() -> Result<(), Box<dyn std::error::Error>>
+    {
         let config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), true);
         let toml_output = config.compose_toml();
 
-        let doc: Document = toml_output.parse().unwrap();
-        let cert_value = doc["certificate"].as_str().unwrap();
+        let doc: Document = toml_output.parse()?;
+        let cert_value = doc["certificate"].as_str().ok_or("missing TOML string")?;
 
-        assert_eq!(
-            cert_value, "",
-            "TOML certificate should be empty when cert is system-verifiable"
-        );
+        let (actual, expected) = (&(cert_value), &(""));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "TOML certificate should be empty when cert is system-verifiable"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_compose_deeplink_self_signed_cert_chain() {
+    fn test_compose_deeplink_self_signed_cert_chain() -> Result<(), Box<dyn std::error::Error>> {
         let config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), false);
-        let uri = config.compose_deeplink().unwrap();
+        let uri = config.compose_deeplink()?;
 
-        let decoded = trusttunnel_deeplink::decode(&uri).unwrap();
+        let decoded = trusttunnel_deeplink::decode(&uri)?;
         let cert_der = decoded
             .certificate
-            .expect("Deep-link should contain certificate when not system-verifiable");
+            .ok_or("Deep-link should contain certificate when not system-verifiable")?;
 
-        let pem = trusttunnel_deeplink::cert::der_to_pem(&cert_der).unwrap();
-        assert_eq!(
-            pem.matches("-----BEGIN CERTIFICATE-----").count(),
-            2,
-            "Deep-link DER should contain both certs from the chain"
-        );
+        let pem = trusttunnel_deeplink::cert::der_to_pem(&cert_der)?;
+        let (actual, expected) = (&(pem.matches("-----BEGIN CERTIFICATE-----").count()), &(2));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "Deep-link DER should contain both certs from the chain"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_compose_deeplink_system_verifiable_cert_omitted() {
+    fn test_compose_deeplink_system_verifiable_cert_omitted(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), true);
-        let uri = config.compose_deeplink().unwrap();
+        let uri = config.compose_deeplink()?;
 
-        let decoded = trusttunnel_deeplink::decode(&uri).unwrap();
-        assert!(
-            decoded.certificate.is_none(),
-            "Deep-link should not contain certificate when cert is system-verifiable"
-        );
+        let decoded = trusttunnel_deeplink::decode(&uri)?;
+        if decoded.certificate.is_some() {
+            return Err(
+                "Deep-link should not contain certificate when cert is system-verifiable".into(),
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -506,70 +690,184 @@ omxU7kknZApM\n\
     }
 
     #[test]
-    fn build_subscription_url_preserves_at_in_path_and_query() {
+    fn build_subscription_url_preserves_at_in_path_and_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // `@` after the authority is not userinfo and must be preserved,
         // matching what `validate_subscription_url_override` allows.
         let url = build_subscription_url("https://vpn.example.com/p@ath", "alice", "s3cret");
-        assert_eq!(url, "https://alice:s3cret@vpn.example.com/p@ath");
+        let (actual, expected) = (&(url), &("https://alice:s3cret@vpn.example.com/p@ath"));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
         let url =
             build_subscription_url("https://vpn.example.com/sub?next=/p@ath", "alice", "s3cret");
-        assert_eq!(url, "https://alice:s3cret@vpn.example.com/sub?next=/p@ath");
+        let (actual, expected) = (
+            &(url),
+            &("https://alice:s3cret@vpn.example.com/sub?next=/p@ath"),
+        );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
         // The authority ends at the first `?` or `#` even without a path.
         let url = build_subscription_url("https://vpn.example.com?next=@x", "alice", "s3cret");
-        assert_eq!(url, "https://alice:s3cret@vpn.example.com?next=@x");
+        let (actual, expected) = (&(url), &("https://alice:s3cret@vpn.example.com?next=@x"));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn compose_toml_emits_subscription_url_when_set() {
+    fn compose_toml_emits_subscription_url_when_set() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), false);
         config.subscription_url =
             Some("https://alice:s3cret@vpn.example.com/subscription".to_string());
         let toml_output = config.compose_toml();
 
-        let doc: Document = toml_output.parse().unwrap();
-        assert_eq!(
-            doc["subscription_url"].as_str().unwrap(),
-            "https://alice:s3cret@vpn.example.com/subscription"
+        let doc: Document = toml_output.parse()?;
+        let (actual, expected) = (
+            &(doc["subscription_url"]
+                .as_str()
+                .ok_or("missing TOML string")?),
+            &("https://alice:s3cret@vpn.example.com/subscription"),
         );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn compose_deeplink_includes_subscription_url() {
+    fn compose_deeplink_includes_subscription_url() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), false);
         let url = "https://alice:s3cret@vpn.example.com/subscription".to_string();
         config.subscription_url = Some(url.clone());
-        let uri = config.compose_deeplink().unwrap();
+        let uri = config.compose_deeplink()?;
 
-        let decoded = trusttunnel_deeplink::decode(&uri).unwrap();
-        assert_eq!(decoded.subscription_url.as_deref(), Some(url.as_str()));
+        let decoded = trusttunnel_deeplink::decode(&uri)?;
+        let (actual, expected) = (
+            &(decoded.subscription_url.as_deref()),
+            &(Some(url.as_str())),
+        );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
         // Static fallback parameters are still present.
-        assert_eq!(decoded.hostname.as_deref(), Some("vpn.example.com"));
-        assert_eq!(decoded.username.as_deref(), Some("alice"));
+        let (actual, expected) = (&(decoded.hostname.as_deref()), &(Some("vpn.example.com")));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        let (actual, expected) = (&(decoded.username.as_deref()), &(Some("alice")));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn compose_deeplink_without_subscription_url() {
+    fn compose_deeplink_without_subscription_url() -> Result<(), Box<dyn std::error::Error>> {
         let config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), false);
-        let uri = config.compose_deeplink().unwrap();
+        let uri = config.compose_deeplink()?;
 
-        let decoded = trusttunnel_deeplink::decode(&uri).unwrap();
-        assert_eq!(decoded.subscription_url, None);
+        let decoded = trusttunnel_deeplink::decode(&uri)?;
+        let (actual, expected) = (&(decoded.subscription_url), &(None));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn compose_deeplink_subscription_only_minimal() {
+    fn compose_deeplink_subscription_only_minimal() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), false);
         let url = "https://alice:s3cret@vpn.example.com/subscription".to_string();
         config.subscription_url = Some(url.clone());
-        let uri = config.compose_deeplink_subscription_only().unwrap();
+        let uri = config.compose_deeplink_subscription_only()?;
 
-        let decoded = trusttunnel_deeplink::decode(&uri).unwrap();
-        assert_eq!(decoded.subscription_url.as_deref(), Some(url.as_str()));
-        assert_eq!(decoded.hostname, None);
-        assert!(decoded.addresses.is_empty());
-        assert_eq!(decoded.username, None);
-        assert_eq!(decoded.password, None);
-        assert_eq!(decoded.certificate, None);
+        let decoded = trusttunnel_deeplink::decode(&uri)?;
+        let (actual, expected) = (
+            &(decoded.subscription_url.as_deref()),
+            &(Some(url.as_str())),
+        );
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        let (actual, expected) = (&(decoded.hostname), &(None));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        if !(decoded.addresses.is_empty()) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(decoded.addresses.is_empty())
+            )
+            .into());
+        }
+        let (actual, expected) = (&(decoded.username), &(None));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        let (actual, expected) = (&(decoded.password), &(None));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        let (actual, expected) = (&(decoded.certificate), &(None));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
@@ -589,7 +887,7 @@ omxU7kknZApM\n\
     fn validate_override_rejects_non_https() {
         let err = validate_subscription_url_override("http://vpn.example.com/subscription");
         assert!(err.is_err());
-        assert!(err.unwrap_err().contains("https"));
+        assert!(err.is_err_and(|error| error.contains("https")));
     }
 
     #[test]
@@ -597,16 +895,42 @@ omxU7kknZApM\n\
         let err =
             validate_subscription_url_override("https://alice:s3cret@vpn.example.com/subscription");
         assert!(err.is_err());
-        assert!(err.unwrap_err().contains("credential"));
+        assert!(err.is_err_and(|error| error.contains("credential")));
     }
 
     #[test]
-    fn validate_override_accepts_at_outside_authority() {
+    fn validate_override_accepts_at_outside_authority() -> Result<(), Box<dyn std::error::Error>> {
         // `@` in the path or query is not userinfo and is allowed.
-        assert!(validate_subscription_url_override("https://vpn.example.com/p@ath").is_ok());
-        assert!(validate_subscription_url_override("https://vpn.example.com/sub?next=@x").is_ok());
+        if validate_subscription_url_override("https://vpn.example.com/p@ath").is_err() {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(
+                    validate_subscription_url_override("https://vpn.example.com/p@ath").is_ok()
+                )
+            )
+            .into());
+        }
+        if validate_subscription_url_override("https://vpn.example.com/sub?next=@x").is_err() {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(validate_subscription_url_override(
+                    "https://vpn.example.com/sub?next=@x"
+                )
+                .is_ok())
+            )
+            .into());
+        }
         // The authority ends at the first `?` or `#` even without a path.
-        assert!(validate_subscription_url_override("https://vpn.example.com?next=@x").is_ok());
+        if validate_subscription_url_override("https://vpn.example.com?next=@x").is_err() {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(
+                    validate_subscription_url_override("https://vpn.example.com?next=@x").is_ok()
+                )
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
@@ -656,5 +980,87 @@ omxU7kknZApM\n\
         config.client_random_auth_key = "aabbccdd".into();
         let toml = config.compose_toml();
         assert!(toml.contains("client_random_auth_key = \"aabbccdd\""));
+    }
+
+    #[test]
+    fn template_preserves_original_export_format() -> Result<(), Box<dyn std::error::Error>> {
+        let original: Document = ORIGINAL_TEMPLATE.parse()?;
+        let (actual, expected) = (&(TEMPLATE.to_string()), &(original.to_string()));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn build_reports_missing_client_and_host() {
+        let hosts = TlsHostsSettings::default();
+        let result = build("alice", vec![], &[], &hosts, BuildOptions::default());
+        assert!(result.is_err_and(|error| error.kind() == io::ErrorKind::InvalidInput));
+        let clients = [registry_based::Client {
+            username: "alice".into(),
+            password: "secret".into(),
+            max_http2_conns: None,
+            max_http3_conns: None,
+        }];
+        let result = build("alice", vec![], &clients, &hosts, BuildOptions::default());
+        assert!(result.is_err_and(|error| error.kind() == io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn debug_scrubs_export_credentials() {
+        let mut config = ClientConfig::test_config(String::new(), false);
+        config.client_random_auth_key = "secret_auth_key".into();
+        config.subscription_url = Some("https://alice:secret@vpn.example.com/subscription".into());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("secret_auth_key"));
+        assert!(!debug.contains("alice:secret"));
+    }
+
+    #[test]
+    fn certificate_getters_preserve_pem_and_system_trust() {
+        for system_verifiable in [false, true] {
+            let config = ClientConfig::test_config("certificate PEM".into(), system_verifiable);
+            assert_eq!(config.get_certificate(), "certificate PEM");
+            assert_eq!(*config.get_cert_is_system_verifiable(), system_verifiable);
+        }
+    }
+
+    #[test]
+    fn export_preserves_independent_client_switches() -> Result<(), Box<dyn std::error::Error>> {
+        for has_ipv6 in [false, true] {
+            for skip_verification in [false, true] {
+                for anti_dpi in [false, true] {
+                    let mut config = ClientConfig::test_config(String::new(), false);
+                    config.has_ipv6 = has_ipv6;
+                    config.skip_verification = skip_verification;
+                    config.anti_dpi = anti_dpi;
+                    let doc: Document = config.compose_toml().parse()?;
+                    if (
+                        doc["has_ipv6"].as_bool(),
+                        doc["skip_verification"].as_bool(),
+                        doc["anti_dpi"].as_bool(),
+                    ) != (Some(has_ipv6), Some(skip_verification), Some(anti_dpi))
+                    {
+                        return Err("TOML changed independent client switches".into());
+                    }
+                    let decoded = trusttunnel_deeplink::decode(&config.compose_deeplink()?)?;
+                    if (
+                        decoded.has_ipv6,
+                        decoded.skip_verification,
+                        decoded.anti_dpi,
+                    ) != (has_ipv6, skip_verification, anti_dpi)
+                    {
+                        return Err("deep-link changed independent client switches".into());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

@@ -6,7 +6,6 @@ use crate::{log_id, log_utils, net_utils, tls_demultiplexer, utils};
 use boring::ssl::{NameType, SelectCertError, SslContextBuilder, SslMethod, SslRef};
 use bytes::{Buf, Bytes, BytesMut};
 use http::header::InvalidHeaderName;
-use lazy_static::lazy_static;
 use quiche::h3;
 use quiche::h3::NameValue;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -14,7 +13,7 @@ use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -26,14 +25,28 @@ const SOCKET_ID_FMT: &str = "QSOCK={}";
 
 const QUIC_CONNECTION_CLOSE_CODE: u64 = 0x42;
 
-type QuicConnection = quiche::Connection;
+static CONN_ID_SEED: LazyLock<Result<ring::hmac::Key, ring::error::Unspecified>> =
+    LazyLock::new(|| {
+        let rng = ring::rand::SystemRandom::new();
+        ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng)
+    });
 
-pub(crate) struct QuicMultiplexer {
+type QuicConnection = quiche::Connection;
+type SharedQuicConnection = Arc<std::sync::Mutex<QuicConnection>>;
+type NewConnectionResult =
+    Result<Either<QuicSocket, SharedQuicConnection>, (io::Error, Option<SharedQuicConnection>)>;
+
+fn recover_poison<T>(error: std::sync::PoisonError<T>) -> T {
+    log::error!("Recovering poisoned QUIC state lock: {error}");
+    error.into_inner()
+}
+
+pub struct QuicMultiplexer {
     core_settings: Arc<Settings>,
     socket: Arc<UdpSocket>,
-    /// Receives messages from [`QuicSocket.mux_tx`]
+    /// Receives messages from [`QuicSocket::mux_tx`]
     socket_rx: mpsc::Receiver<SocketMessage>,
-    /// See [`QuicSocket.mux_tx`]
+    /// See [`QuicSocket::mux_tx`]
     mux_tx: Arc<std::sync::Mutex<mpsc::Sender<SocketMessage>>>,
     connections: HashMap<quiche::ConnectionId<'static>, Connection>,
     deadlines: HashMap<quiche::ConnectionId<'static>, Instant>,
@@ -44,10 +57,10 @@ pub(crate) struct QuicMultiplexer {
     next_socket_id: Arc<AtomicU64>,
 }
 
-pub(crate) struct QuicSocket {
-    /// Receives messages from [`EstablishedConnection.socket_tx`]
+pub struct QuicSocket {
+    /// Receives messages from [`EstablishedConnection::socket_tx`]
     conn_rx: tokio::sync::Mutex<mpsc::Receiver<MultiplexerMessage>>,
-    /// Sends messages to [`QuicMultiplexer.socket_rx`]
+    /// Sends messages to [`QuicMultiplexer::socket_rx`]
     mux_tx: Arc<std::sync::Mutex<mpsc::Sender<SocketMessage>>>,
     peer: SocketAddr,
     udp_socket: Arc<UdpSocket>,
@@ -56,11 +69,11 @@ pub(crate) struct QuicSocket {
     waiting_writable_streams: std::sync::Mutex<HashSet<u64>>,
     id: log_utils::IdChain<u64>,
     tls_connection_meta: tls_demultiplexer::ConnectionMeta,
-    /// TLS client_random extracted from QUIC handshake
+    /// TLS `client_random` extracted from QUIC handshake
     client_random: Vec<u8>,
 }
 
-pub(crate) enum QuicSocketEvent {
+pub enum QuicSocketEvent {
     Request(/* stream id */ u64, Box<RequestHeaders>),
     Readable(/* stream id */ u64),
     Writable(Vec</* stream id */ u64>),
@@ -88,7 +101,7 @@ struct HandshakingConnection {
 }
 
 struct EstablishedConnection {
-    /// Sends messages to [`QuicSocket.conn_rx`]
+    /// Sends messages to [`QuicSocket::conn_rx`]
     socket_tx: mpsc::Sender<MultiplexerMessage>,
     quic_conn: Arc<std::sync::Mutex<QuicConnection>>,
 }
@@ -115,10 +128,10 @@ struct BackgroundConnection {
 }
 
 impl BackgroundConnection {
-    fn with_conn(conn: Arc<std::sync::Mutex<QuicConnection>>) -> Self {
+    const fn with_conn(conn: Arc<std::sync::Mutex<QuicConnection>>) -> Self {
         Self {
             quic: conn,
-            message: Default::default(),
+            message: None,
         }
     }
 }
@@ -134,7 +147,7 @@ impl QuicMultiplexer {
             .listen_protocols
             .quic
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| io::Error::other("QUIC listening is not configured"))?
             .message_queue_capacity;
         let (tx, rx) = mpsc::channel(queue_cap);
 
@@ -143,12 +156,14 @@ impl QuicMultiplexer {
             socket: Arc::new(socket),
             socket_rx: rx,
             mux_tx: Arc::new(std::sync::Mutex::new(tx)),
-            connections: Default::default(),
-            deadlines: Default::default(),
+            connections: HashMap::new(),
+            deadlines: HashMap::new(),
             closest_deadline: None,
             tls_demux,
             token_prefix: ring::rand::generate(&ring::rand::SystemRandom::new())
-                .unwrap()
+                .map_err(|e| {
+                    io::Error::other(format!("Failed to generate QUIC token prefix: {e}"))
+                })?
                 .expose(),
             id: log_utils::IdChain::from(log_utils::IdItem::new(MUX_ID_FMT, 0)),
             next_socket_id,
@@ -175,7 +190,7 @@ impl QuicMultiplexer {
 
                 tokio::select! {
                     r = wait_udp_read => match r {
-                        Ok(_) => Some(Event::UdpRead),
+                        Ok(()) => Some(Event::UdpRead),
                         Err(e) => return Err(e),
                     },
                     r = wait_udp_send => match r {
@@ -185,7 +200,7 @@ impl QuicMultiplexer {
                     // Arm this even for an expired deadline: tokio timers fire slightly
                     // after the deadline, so a `> now` guard disables the branch exactly
                     // when the timer fires and timeouts would only run on incoming packets.
-                    _ = &mut wait_timeout, if self.closest_deadline.is_some() => None,
+                    () = &mut wait_timeout, if self.closest_deadline.is_some() => None,
                 }
             };
 
@@ -193,7 +208,7 @@ impl QuicMultiplexer {
 
             match event {
                 None => (),
-                Some(Event::UdpSend(m)) => self.on_socket_message(m)?,
+                Some(Event::UdpSend(m)) => self.on_socket_message(m),
                 Some(Event::UdpRead) => {
                     if let Some(s) = self.read_udp_socket()? {
                         return Ok(s);
@@ -217,7 +232,7 @@ impl QuicMultiplexer {
 
         let mut socket = None;
         let mut pending = HashMap::with_capacity(READ_BUDGET / 2);
-        let mut buffer = [0; net_utils::MAX_UDP_PAYLOAD_SIZE];
+        let mut buffer = vec![0; net_utils::MAX_UDP_PAYLOAD_SIZE];
         for _ in 0..READ_BUDGET {
             match self.socket.try_recv_from(&mut buffer) {
                 Ok((n, peer)) => {
@@ -238,8 +253,8 @@ impl QuicMultiplexer {
                         Some(Either::Left(s)) => {
                             pending.entry(header.dcid).or_insert_with(|| Entry {
                                 conn: s.quic_conn.clone(),
-                                socket_tx: Default::default(),
-                                messages: Default::default(),
+                                socket_tx: None,
+                                messages: BTreeSet::new(),
                             });
                             socket = Some(s);
                             break;
@@ -248,14 +263,14 @@ impl QuicMultiplexer {
                             let entry = pending.entry(header.dcid).or_insert_with(|| Entry {
                                 conn: x.quic,
                                 socket_tx: None,
-                                messages: Default::default(),
+                                messages: BTreeSet::new(),
                             });
                             if let Some((tx, msg)) = x.message {
                                 entry.socket_tx = Some(tx);
                                 entry.messages.insert(msg);
                             }
                         }
-                        None => continue,
+                        None => (),
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -272,16 +287,19 @@ impl QuicMultiplexer {
                 .try_for_each(|(sender, msg)| match sender.try_send(msg) {
                     // `Full` is not considered as an error in this case, as the connection does not need
                     // multiple `poll` messages in the queue
-                    Ok(_) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         Err(io::Error::other("Channel closed"))
                     }
                 });
 
-            let mut quic_conn = entry.conn.lock().unwrap();
+            let mut quic_conn = entry.conn.lock().unwrap_or_else(recover_poison);
             if let Err(e) = result {
-                let _ =
-                    quic_conn.close(false, QUIC_CONNECTION_CLOSE_CODE, e.to_string().as_bytes());
+                if let Err(e) =
+                    quic_conn.close(false, QUIC_CONNECTION_CLOSE_CODE, e.to_string().as_bytes())
+                {
+                    log_id!(debug, self.id, "Failed to close QUIC connection: {}", e);
+                }
             }
 
             if let Some(timeout) = quic_conn.timeout() {
@@ -291,6 +309,7 @@ impl QuicMultiplexer {
             if let Err(e) = flush_pending_data(&mut quic_conn, &self.socket, &self.id) {
                 log_id!(debug, self.id, "Failed to flush QUIC connection: {}", e);
             }
+            drop(quic_conn);
         }
 
         Ok(socket)
@@ -341,14 +360,14 @@ impl QuicMultiplexer {
                     }
                     Ok(HandshakeStatus::Complete) => {
                         self.deadlines.remove(&header.dcid);
-                        let conn = self
-                            .connections
-                            .remove(&header.dcid)
-                            .map(|x| match x {
-                                Connection::Handshake(x) => x,
-                                Connection::Established(_) => unreachable!(),
-                            })
-                            .unwrap();
+                        let conn = self.connections.remove(&header.dcid).and_then(|x| match x {
+                            Connection::Handshake(x) => Some(x),
+                            Connection::Established(_) => None,
+                        });
+                        let Some(conn) = conn else {
+                            log_id!(error, self.id, "QUIC handshake connection disappeared");
+                            return None;
+                        };
                         match self.finalize_established_connection(&header.dcid, conn, peer) {
                             Ok(sock) => return Some(Either::with_left(sock)),
                             Err((e, q)) => (q, e),
@@ -371,7 +390,7 @@ impl QuicMultiplexer {
         };
 
         {
-            let mut quic_conn = quic_conn.lock().unwrap();
+            let mut quic_conn = quic_conn.lock().unwrap_or_else(recover_poison);
             log_id!(
                 debug,
                 self.id,
@@ -379,11 +398,13 @@ impl QuicMultiplexer {
                 header,
                 err
             );
-            let _ = quic_conn.close(
+            if let Err(e) = quic_conn.close(
                 false,
                 QUIC_CONNECTION_CLOSE_CODE,
                 err.to_string().as_bytes(),
-            );
+            ) {
+                log_id!(debug, self.id, "Failed to close QUIC connection: {}", e);
+            }
         }
 
         Some(Either::with_right(BackgroundConnection::with_conn(
@@ -398,16 +419,15 @@ impl QuicMultiplexer {
     ) -> io::Result<UnknownPacketStatus> {
         if !matches!(header.ty, quiche::Type::Initial) {
             return Err(io::Error::other(format!(
-                "Unexpected packet type: {:?}",
-                header
+                "Unexpected packet type: {header:?}"
             )));
         }
 
         if !quiche::version_is_supported(header.version) {
             log_id!(trace, self.id, "Doing version negotiation: {:?}", header);
-            let mut out = [0; net_utils::MAX_UDP_PAYLOAD_SIZE];
+            let mut out = vec![0; net_utils::MAX_UDP_PAYLOAD_SIZE];
             let n = quiche::negotiate_version(&header.scid, &header.dcid, &mut out)
-                .map_err(|e| io::Error::other(format!("Version negotiation failed: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("Version negotiation failed: {e}")))?;
             return self
                 .socket
                 .try_send_to(&out[..n], *peer)
@@ -419,21 +439,17 @@ impl QuicMultiplexer {
             .as_ref()
             .ok_or_else(|| io::Error::other("Invalid packet: initial packet must contain token"))?;
 
-        lazy_static! {
-            static ref CONN_ID_SEED: ring::hmac::Key = {
-                let rng = ring::rand::SystemRandom::new();
-                ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap()
-            };
-        }
-
-        let conn_id = ring::hmac::sign(&CONN_ID_SEED, &header.dcid);
+        let seed = CONN_ID_SEED.as_ref().map_err(|e| {
+            io::Error::other(format!("Failed to generate QUIC connection ID seed: {e}"))
+        })?;
+        let conn_id = ring::hmac::sign(seed, &header.dcid);
         let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
 
         let scid = quiche::ConnectionId::from_ref(conn_id);
 
         if quic_token.is_empty() {
             log_id!(trace, self.id, "Doing stateless retry: {:?}", header);
-            let mut out = [0; net_utils::MAX_UDP_PAYLOAD_SIZE];
+            let mut out = vec![0; net_utils::MAX_UDP_PAYLOAD_SIZE];
             let n = quiche::retry(
                 &header.scid,
                 &header.dcid,
@@ -442,7 +458,7 @@ impl QuicMultiplexer {
                 header.version,
                 &mut out,
             )
-            .map_err(|e| io::Error::other(format!("Retry failed: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("Retry failed: {e}")))?;
             return self
                 .socket
                 .try_send_to(&out[..n], *peer)
@@ -467,9 +483,9 @@ impl QuicMultiplexer {
     ) -> io::Result<QuicConnection> {
         let local_address = self.core_settings.listen_address;
         let mut quic_config =
-            make_quic_config_with_domain_contexts(&self.core_settings, self.tls_demux.clone())?;
+            make_quic_config_with_domain_contexts(&self.core_settings, &self.tls_demux)?;
         let mut quic_conn = quiche::accept(scid, odcid, local_address, *peer, &mut quic_config)
-            .map_err(|e| io::Error::other(format!("Failed to accept QUIC connection: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("Failed to accept QUIC connection: {e}")))?;
 
         quic_recv(
             &mut quic_conn,
@@ -494,35 +510,38 @@ impl QuicMultiplexer {
 
         let sni = quic_conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(recover_poison)
             .server_name()
             .unwrap_or("")
             .to_string();
 
-        if !sni.is_empty() {
-            if let Ok(meta) = self.tls_demux.read().unwrap().select(
-                std::iter::once(tls_demultiplexer::Protocol::Http3.as_alpn().as_bytes()),
-                sni,
-            ) {
-                conn.tls_connection_meta = meta;
-            }
-        } else {
+        if sni.is_empty() {
             log_id!(
                 debug,
                 self.id,
                 "SNI is empty in finalize_established_connection, using bootstrap meta"
             );
+        } else {
+            let tls_demux = self.tls_demux.read().unwrap_or_else(recover_poison);
+            if let Ok(meta) = tls_demux.select(
+                std::iter::once(tls_demultiplexer::Protocol::Http3.as_alpn().as_bytes()),
+                sni,
+            ) {
+                conn.tls_connection_meta = meta;
+            }
+            drop(tls_demux);
         }
 
         let h3_conn = {
-            let mut quic = quic_conn.lock().unwrap();
-            let h3_config = h3::Config::new().unwrap();
+            let mut quic = quic_conn.lock().unwrap_or_else(recover_poison);
+            let h3_config = h3::Config::new()
+                .map_err(|e| (io::Error::other(e.to_string()), quic_conn.clone()))?;
             let h3_conn = match h3::Connection::with_transport(&mut quic, &h3_config) {
                 Ok(x) => x,
                 Err(e) => {
                     drop(quic);
                     return Err((
-                        io::Error::other(format!("Failed to open HTTP3 session: {}", e)),
+                        io::Error::other(format!("Failed to open HTTP3 session: {e}")),
                         quic_conn,
                     ));
                 }
@@ -534,11 +553,13 @@ impl QuicMultiplexer {
 
         // Extract client_random from QUIC after handshake is complete
         let extracted_client_random = {
-            let mut quic = quic_conn.lock().unwrap();
+            let mut quic = quic_conn.lock().unwrap_or_else(recover_poison);
             let ssl: &mut SslRef = quic.as_mut();
             let mut client_random = [0u8; 32];
             ssl.client_random(&mut client_random);
-            client_random.to_vec()
+            let client_random = client_random.to_vec();
+            drop(quic);
+            client_random
         };
 
         let (tx, rx) = mpsc::channel(1);
@@ -557,7 +578,7 @@ impl QuicMultiplexer {
             udp_socket: self.socket.clone(),
             quic_conn,
             h3_conn,
-            waiting_writable_streams: Default::default(),
+            waiting_writable_streams: std::sync::Mutex::default(),
             id: self.id.extended(log_utils::IdItem::new(
                 SOCKET_ID_FMT,
                 self.next_socket_id.fetch_add(1, Ordering::Relaxed),
@@ -567,17 +588,17 @@ impl QuicMultiplexer {
         })
     }
 
-    #[allow(clippy::type_complexity)]
     fn on_new_connection(
         &mut self,
         peer: &SocketAddr,
         header: &quiche::Header<'_>,
         packet: &mut [u8],
-    ) -> Result<
-        Either<QuicSocket, Arc<std::sync::Mutex<QuicConnection>>>,
-        (io::Error, Option<Arc<std::sync::Mutex<QuicConnection>>>),
-    > {
-        let odcid = validate_token(&self.token_prefix, peer, header.token.as_ref().unwrap())
+    ) -> NewConnectionResult {
+        let token = header
+            .token
+            .as_ref()
+            .ok_or_else(|| (io::Error::other("Invalid packet: token missing"), None))?;
+        let odcid = validate_token(&self.token_prefix, peer, token)
             .ok_or_else(|| (io::Error::other("Invalid packet: unexpected token"), None))?;
 
         log_id!(
@@ -597,8 +618,9 @@ impl QuicMultiplexer {
         let tls_connection_meta = self
             .tls_demux
             .read()
-            .unwrap()
-            .get_quic_connection_bootstrap_meta();
+            .unwrap_or_else(recover_poison)
+            .get_quic_connection_bootstrap_meta()
+            .map_err(|e| (e, None))?;
 
         log_id!(debug, self.id, "Bootstrap meta: {:?}", tls_connection_meta);
 
@@ -631,7 +653,7 @@ impl QuicMultiplexer {
         packet: &mut [u8],
     ) -> io::Result<()> {
         quic_recv(
-            &mut conn.quic_conn.lock().unwrap(),
+            &mut conn.quic_conn.lock().unwrap_or_else(recover_poison),
             packet,
             &quiche::RecvInfo {
                 from: *peer,
@@ -679,7 +701,7 @@ impl QuicMultiplexer {
             };
 
             let new_timeout = {
-                let mut quic_conn = quic_conn_arc.lock().unwrap();
+                let mut quic_conn = quic_conn_arc.lock().unwrap_or_else(recover_poison);
                 quic_conn.on_timeout();
                 if let Err(e) = flush_pending_data(&mut quic_conn, &self.socket, &self.id) {
                     log_id!(debug, self.id, "Failed to flush after on_timeout: {}", e);
@@ -695,19 +717,18 @@ impl QuicMultiplexer {
         self.closest_deadline = self.deadlines.values().min().copied();
     }
 
-    fn on_socket_message(&mut self, message: SocketMessage) -> io::Result<()> {
+    fn on_socket_message(&mut self, message: SocketMessage) {
         match message {
             SocketMessage::Close(conn_id) => {
                 self.connections.remove(&conn_id);
-                Ok(())
             }
             SocketMessage::RefreshDeadline(conn_id) => {
                 let quic_conn = match self.connections.get(&conn_id) {
                     Some(Connection::Handshake(c)) => c.quic_conn.clone(),
                     Some(Connection::Established(c)) => c.quic_conn.clone(),
-                    None => return Ok(()),
+                    None => return,
                 };
-                let timeout = quic_conn.lock().unwrap().timeout();
+                let timeout = quic_conn.lock().unwrap_or_else(recover_poison).timeout();
                 match timeout {
                     Some(d) => self.update_connection_deadline(conn_id, d),
                     None => {
@@ -716,7 +737,6 @@ impl QuicMultiplexer {
                         }
                     }
                 }
-                Ok(())
             }
         }
     }
@@ -724,7 +744,7 @@ impl QuicMultiplexer {
     fn process_pending_socket_messages(&mut self) -> io::Result<()> {
         loop {
             match self.socket_rx.try_recv() {
-                Ok(m) => self.on_socket_message(m)?,
+                Ok(m) => self.on_socket_message(m),
                 Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     return Err(io::Error::other(
@@ -740,8 +760,16 @@ impl QuicMultiplexer {
             .connections
             .iter()
             .filter(|(_, conn)| match conn {
-                Connection::Handshake(c) => c.quic_conn.lock().unwrap().is_closed(),
-                Connection::Established(c) => c.quic_conn.lock().unwrap().is_closed(),
+                Connection::Handshake(c) => c
+                    .quic_conn
+                    .lock()
+                    .unwrap_or_else(recover_poison)
+                    .is_closed(),
+                Connection::Established(c) => c
+                    .quic_conn
+                    .lock()
+                    .unwrap_or_else(recover_poison)
+                    .is_closed(),
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -749,9 +777,17 @@ impl QuicMultiplexer {
         for conn_id in closed {
             self.deadlines.remove(&conn_id);
             if let Some(Connection::Established(c)) = self.connections.remove(&conn_id) {
-                let _ = c.socket_tx.try_send(MultiplexerMessage::Close);
+                if let Err(e) = c.socket_tx.try_send(MultiplexerMessage::Close) {
+                    log_id!(debug, self.id, "Failed to notify closed QUIC socket: {}", e);
+                }
             }
         }
+    }
+}
+
+impl net_utils::PeerAddr for QuicSocket {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.peer)
     }
 }
 
@@ -760,11 +796,7 @@ impl QuicSocket {
         self.id.clone()
     }
 
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.peer)
-    }
-
-    pub fn tls_connection_meta(&self) -> &tls_demultiplexer::ConnectionMeta {
+    pub const fn tls_connection_meta(&self) -> &tls_demultiplexer::ConnectionMeta {
         &self.tls_connection_meta
     }
 
@@ -792,9 +824,9 @@ impl QuicSocket {
 
         self.h3_conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(recover_poison)
             .send_response(
-                &mut self.quic_conn.lock().unwrap(),
+                &mut self.quic_conn.lock().unwrap_or_else(recover_poison),
                 stream_id,
                 response.as_slice(),
                 fin,
@@ -819,11 +851,9 @@ impl QuicSocket {
             let mut read_offset = 0;
             loop {
                 let buf = bytes.split_at_mut(read_offset).1;
-                match self.h3_conn.lock().unwrap().recv_body(
-                    &mut self.quic_conn.lock().unwrap(),
-                    stream_id,
-                    buf,
-                ) {
+                let mut h3_conn = self.h3_conn.lock().unwrap_or_else(recover_poison);
+                let mut quic_conn = self.quic_conn.lock().unwrap_or_else(recover_poison);
+                match h3_conn.recv_body(&mut quic_conn, stream_id, buf) {
                     Ok(n) => {
                         read_offset += n;
                         if read_offset == bytes.capacity() {
@@ -836,7 +866,9 @@ impl QuicSocket {
                     }
                     Err(h3::Error::Done) => break None,
                     Err(e) => return Err(io::Error::other(e.to_string())),
-                };
+                }
+                drop(quic_conn);
+                drop(h3_conn);
             }
         };
 
@@ -845,36 +877,40 @@ impl QuicSocket {
     }
 
     pub fn write(&self, stream_id: u64, mut data: Bytes) -> io::Result<Bytes> {
-        match self.h3_conn.lock().unwrap().send_body(
-            &mut self.quic_conn.lock().unwrap(),
-            stream_id,
-            data.as_ref(),
-            false,
-        ) {
-            Ok(n) => data.advance(n),
-            Err(h3::Error::Done | h3::Error::StreamBlocked) => (),
-            Err(e) => return Err(io::Error::other(e.to_string())),
+        {
+            let mut h3_conn = self.h3_conn.lock().unwrap_or_else(recover_poison);
+            let mut quic_conn = self.quic_conn.lock().unwrap_or_else(recover_poison);
+            match h3_conn.send_body(&mut quic_conn, stream_id, data.as_ref(), false) {
+                Ok(n) => data.advance(n),
+                Err(h3::Error::Done | h3::Error::StreamBlocked) => (),
+                Err(e) => return Err(io::Error::other(e.to_string())),
+            }
+            drop(quic_conn);
+            drop(h3_conn);
         }
 
-        self.flush_pending_data().map(|_| data)
+        self.flush_pending_data().map(|()| data)
     }
 
     pub fn stream_capacity(&self, stream_id: u64) -> io::Result<usize> {
         self.quic_conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(recover_poison)
             .stream_capacity(stream_id)
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
     pub fn stream_finished(&self, stream_id: u64) -> bool {
-        self.quic_conn.lock().unwrap().stream_finished(stream_id)
+        self.quic_conn
+            .lock()
+            .unwrap_or_else(recover_poison)
+            .stream_finished(stream_id)
     }
 
     pub fn notify_stream_waiting_writable(&self, stream_id: u64) {
         self.waiting_writable_streams
             .lock()
-            .unwrap()
+            .unwrap_or_else(recover_poison)
             .insert(stream_id);
     }
 
@@ -882,36 +918,47 @@ impl QuicSocket {
         match direction {
             quiche::Shutdown::Write => {
                 // `stream_shutdown(Write)` is dropping still unsent data
-                let _ = self
-                    .quic_conn
-                    .lock()
-                    .unwrap()
-                    .stream_send(stream_id, &[], true);
+                let mut quic_conn = self.quic_conn.lock().unwrap_or_else(recover_poison);
+                if let Err(e) = quic_conn.stream_send(stream_id, &[], true) {
+                    log_id!(debug, self.id, "Failed to finish QUIC stream: {}", e);
+                }
+                drop(quic_conn);
             }
             quiche::Shutdown::Read => {
-                let _ = self
-                    .quic_conn
-                    .lock()
-                    .unwrap()
-                    .stream_shutdown(stream_id, direction, 0);
+                let mut quic_conn = self.quic_conn.lock().unwrap_or_else(recover_poison);
+                if let Err(e) = quic_conn.stream_shutdown(stream_id, direction, 0) {
+                    log_id!(debug, self.id, "Failed to shut down QUIC stream: {}", e);
+                }
+                drop(quic_conn);
             }
         }
-        let _ = self.flush_pending_data();
+        if let Err(e) = self.flush_pending_data() {
+            log_id!(debug, self.id, "Failed to flush QUIC shutdown data: {}", e);
+        }
     }
 
     pub fn graceful_shutdown(&self) -> io::Result<()> {
         {
-            let mut quic_conn = self.quic_conn.lock().unwrap();
-            let mut h3_conn = self.h3_conn.lock().unwrap();
+            let mut quic_conn = self.quic_conn.lock().unwrap_or_else(recover_poison);
+            let mut h3_conn = self.h3_conn.lock().unwrap_or_else(recover_poison);
             for stream_id in quic_conn.writable() {
-                let _ = h3_conn.send_body(&mut quic_conn, stream_id, &[], true);
+                if let Err(e) = h3_conn.send_body(&mut quic_conn, stream_id, &[], true) {
+                    log_id!(
+                        debug,
+                        self.id,
+                        "Failed to finish HTTP3 stream during shutdown: {}",
+                        e
+                    );
+                }
             }
         }
-        let _ = self.flush_pending_data();
+        if let Err(e) = self.flush_pending_data() {
+            log_id!(debug, self.id, "Failed to flush QUIC shutdown data: {}", e);
+        }
 
         self.quic_conn
             .lock()
-            .unwrap()
+            .unwrap_or_else(recover_poison)
             .close(true, 0, b"bye")
             .map_err(|e| io::Error::other(e.to_string()))?;
         self.flush_pending_data()
@@ -923,8 +970,12 @@ impl QuicSocket {
                 match self.process_pending_h3_events()? {
                     None => {
                         let writable_streams: Vec<_> = {
-                            let mut quic_conn = self.quic_conn.lock().unwrap();
-                            let mut waiting_streams = self.waiting_writable_streams.lock().unwrap();
+                            let mut quic_conn =
+                                self.quic_conn.lock().unwrap_or_else(recover_poison);
+                            let mut waiting_streams = self
+                                .waiting_writable_streams
+                                .lock()
+                                .unwrap_or_else(recover_poison);
                             // Avoid emitting Writable events for streams with negligible capacity.
                             let writable_streams: Vec<_> = waiting_streams
                                 .iter()
@@ -959,13 +1010,20 @@ impl QuicSocket {
                 }
             };
 
-            let quic_conn = self.quic_conn.lock().unwrap();
+            let quic_conn = self.quic_conn.lock().unwrap_or_else(recover_poison);
             if quic_conn.is_closed() {
-                let _ = self
-                    .mux_tx
-                    .lock()
-                    .unwrap()
-                    .try_send(SocketMessage::Close(quic_conn.source_id().into_owned()));
+                let mux_tx = self.mux_tx.lock().unwrap_or_else(recover_poison);
+                if let Err(e) =
+                    mux_tx.try_send(SocketMessage::Close(quic_conn.source_id().into_owned()))
+                {
+                    log_id!(
+                        debug,
+                        self.id,
+                        "Failed to notify closed QUIC connection: {}",
+                        e
+                    );
+                }
+                drop(mux_tx);
                 return Err(io::Error::from(ErrorKind::UnexpectedEof));
             }
 
@@ -973,44 +1031,43 @@ impl QuicSocket {
                 None => (),
                 Some(ev) => return Ok(ev),
             }
+            drop(quic_conn);
         }
     }
 
     fn flush_pending_data(&self) -> io::Result<()> {
         let (result, conn_id) = {
-            let mut quic_conn = self.quic_conn.lock().unwrap();
+            let mut quic_conn = self.quic_conn.lock().unwrap_or_else(recover_poison);
             let r = flush_pending_data(&mut quic_conn, &self.udp_socket, &self.id);
             (r, quic_conn.source_id().into_owned())
         };
         // Notify the multiplexer that the loss-detection timer may have changed
-        let _ = self
-            .mux_tx
-            .lock()
-            .unwrap()
-            .try_send(SocketMessage::RefreshDeadline(conn_id));
+        let mux_tx = self.mux_tx.lock().unwrap_or_else(recover_poison);
+        if let Err(e) = mux_tx.try_send(SocketMessage::RefreshDeadline(conn_id)) {
+            log_id!(debug, self.id, "Failed to refresh QUIC deadline: {}", e);
+        }
+        drop(mux_tx);
         result
     }
 
     fn poll_h3_connection(&self) -> h3::Result<(u64, h3::Event)> {
         self.h3_conn
             .lock()
-            .unwrap()
-            .poll(&mut self.quic_conn.lock().unwrap())
+            .unwrap_or_else(recover_poison)
+            .poll(&mut self.quic_conn.lock().unwrap_or_else(recover_poison))
     }
 
     fn process_pending_h3_events(&self) -> io::Result<Option<QuicSocketEvent>> {
         match self.poll_h3_connection() {
             Ok((stream_id, h3::Event::Headers { list, .. })) => {
-                match self.on_request(stream_id, list) {
+                match Self::on_request(stream_id, list) {
                     Ok(x) => Ok(Some(x)),
                     Err(e) => {
-                        let response = http::Response::builder()
-                            .status(http::StatusCode::BAD_REQUEST)
-                            .body(())
-                            .unwrap()
-                            .into_parts()
-                            .0;
-                        let _ = self.send_response(stream_id, &response, true);
+                        let mut response = http::Response::<()>::default().into_parts().0;
+                        response.status = http::StatusCode::BAD_REQUEST;
+                        if let Err(e) = self.send_response(stream_id, &response, true) {
+                            log_id!(debug, self.id, "Failed to send bad HTTP3 response: {}", e);
+                        }
                         Err(e)
                     }
                 }
@@ -1027,16 +1084,15 @@ impl QuicSocket {
                 );
                 Ok(Some(QuicSocketEvent::Close(stream_id)))
             }
-            Ok((_, h3::Event::PriorityUpdate)) => Ok(None),
+            Ok((_, h3::Event::PriorityUpdate)) | Err(h3::Error::Done) => Ok(None),
             Ok((_, h3::Event::GoAway)) => {
                 Err(io::Error::new(ErrorKind::UnexpectedEof, "Received GOAWAY"))
             }
-            Err(h3::Error::Done) => Ok(None),
             Err(e) => Err(io::Error::other(e.to_string())),
         }
     }
 
-    fn on_request(&self, stream_id: u64, headers: Vec<h3::Header>) -> io::Result<QuicSocketEvent> {
+    fn on_request(stream_id: u64, headers: Vec<h3::Header>) -> io::Result<QuicSocketEvent> {
         let mut request_builder = http::request::Request::builder().version(http::Version::HTTP_3);
 
         let mut uri_builder = http::uri::Uri::builder();
@@ -1061,12 +1117,14 @@ impl QuicSocket {
         }
 
         request_builder
-            .uri(uri_builder.build().map_err(|e| {
-                io::Error::new(ErrorKind::InvalidData, format!("Invalid URI: {}", e))
-            })?)
+            .uri(
+                uri_builder.build().map_err(|e| {
+                    io::Error::new(ErrorKind::InvalidData, format!("Invalid URI: {e}"))
+                })?,
+            )
             .body(())
             .map(|r| QuicSocketEvent::Request(stream_id, Box::new(r.into_parts().0)))
-            .map_err(|e| io::Error::other(format!("Invalid request: {}", e)))
+            .map_err(|e| io::Error::other(format!("Invalid request: {e}")))
     }
 }
 
@@ -1077,7 +1135,7 @@ impl HandshakingConnection {
         packet: &mut [u8],
         log_id: &log_utils::IdChain<u64>,
     ) -> io::Result<HandshakeStatus> {
-        let mut quic_conn = self.quic_conn.lock().unwrap();
+        let mut quic_conn = self.quic_conn.lock().unwrap_or_else(recover_poison);
         quic_recv(
             &mut quic_conn,
             packet,
@@ -1095,15 +1153,12 @@ impl HandshakingConnection {
             )));
         }
 
-        if quic_conn.is_draining() {
-            return Ok(HandshakeStatus::InProgress);
+        if quic_conn.is_draining() || (!quic_conn.is_established() && !quic_conn.is_in_early_data())
+        {
+            Ok(HandshakeStatus::InProgress)
+        } else {
+            Ok(HandshakeStatus::Complete)
         }
-
-        if !quic_conn.is_established() && !quic_conn.is_in_early_data() {
-            return Ok(HandshakeStatus::InProgress);
-        }
-
-        Ok(HandshakeStatus::Complete)
     }
 }
 
@@ -1112,7 +1167,7 @@ fn flush_pending_data(
     udp_socket: &UdpSocket,
     id: &log_utils::IdChain<u64>,
 ) -> io::Result<()> {
-    let mut out = [0; net_utils::MAX_UDP_PAYLOAD_SIZE];
+    let mut out = vec![0; net_utils::MAX_UDP_PAYLOAD_SIZE];
     loop {
         match quic_conn.send(&mut out) {
             Ok((n, info)) => udp_socket_send_to(udp_socket, &out[..n], &info.to, id)?,
@@ -1165,15 +1220,19 @@ fn quic_recv(
             }
             Ok(())
         }
-        Err(e) => Err(io::Error::other(format!("QUIC receive failure: {}", e))),
+        Err(e) => Err(io::Error::other(format!("QUIC receive failure: {e}"))),
     }
 }
 
 fn make_quic_config_with_domain_contexts(
     core_settings: &Settings,
-    tls_demux: Arc<std::sync::RwLock<TlsDemux>>,
+    tls_demux: &Arc<std::sync::RwLock<TlsDemux>>,
 ) -> io::Result<quiche::Config> {
-    let quic_settings = core_settings.listen_protocols.quic.as_ref().unwrap();
+    let quic_settings = core_settings
+        .listen_protocols
+        .quic
+        .as_ref()
+        .ok_or_else(|| io::Error::other("QUIC listening is not configured"))?;
 
     // Create main SSL context with SNI callback that dynamically creates and switches contexts
     let mut main_ctx = SslContextBuilder::new(SslMethod::tls())?;
@@ -1185,13 +1244,14 @@ fn make_quic_config_with_domain_contexts(
             return Ok(());
         };
 
-        let meta = match tls_demux_clone.read().unwrap().select(
+        let tls_demux = tls_demux_clone.read().unwrap_or_else(recover_poison);
+        let Ok(meta) = tls_demux.select(
             std::iter::once(tls_demultiplexer::Protocol::Http3.as_alpn().as_bytes()),
             sni.to_string(),
-        ) {
-            Ok(m) => m,
-            Err(_) => return Ok(()), // unknown SNI -> bootstrap cert
+        ) else {
+            return Ok(()); // unknown SNI -> bootstrap cert
         };
+        drop(tls_demux);
 
         if meta.boring.chain.is_empty() {
             return Err(SelectCertError::ERROR);
@@ -1216,15 +1276,15 @@ fn make_quic_config_with_domain_contexts(
     // Load bootstrap certificate as default
     let bootstrap_meta = tls_demux
         .read()
-        .unwrap()
-        .get_quic_connection_bootstrap_meta();
+        .unwrap_or_else(recover_poison)
+        .get_quic_connection_bootstrap_meta()?;
     main_ctx.set_certificate_chain_file(&bootstrap_meta.cert_chain_path)?;
     main_ctx.set_private_key_file(&bootstrap_meta.key_path, boring::ssl::SslFiletype::PEM)?;
 
     let mut cfg = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, main_ctx)
-        .map_err(|e| io::Error::other(format!("Failed to create QUIC config: {}", e)))?;
+        .map_err(|e| io::Error::other(format!("Failed to create QUIC config: {e}")))?;
     cfg.set_application_protos(h3::APPLICATION_PROTOCOL)
-        .unwrap();
+        .map_err(|e| io::Error::other(format!("Failed to set QUIC application protocols: {e}")))?;
     cfg.set_max_idle_timeout(core_settings.client_listener_timeout.as_millis() as u64);
     cfg.set_max_recv_udp_payload_size(quic_settings.recv_udp_payload_size);
     cfg.set_max_send_udp_payload_size(quic_settings.send_udp_payload_size);
@@ -1248,28 +1308,28 @@ fn socket_addr_to_vec(addr: &SocketAddr) -> Vec<u8> {
         std::net::IpAddr::V4(a) => a
             .octets()
             .iter()
-            .cloned()
-            .chain(addr.port().to_be_bytes().iter().cloned())
+            .copied()
+            .chain(addr.port().to_be_bytes().iter().copied())
             .collect(),
         std::net::IpAddr::V6(a) => a
             .octets()
             .iter()
-            .cloned()
-            .chain(addr.port().to_be_bytes().iter().cloned())
+            .copied()
+            .chain(addr.port().to_be_bytes().iter().copied())
             .collect(),
     }
 }
 
 fn mint_token(
-    header: &quiche::Header,
+    header: &quiche::Header<'_>,
     prefix: &[u8; TOKEN_PREFIX_SIZE],
     peer: &SocketAddr,
 ) -> Vec<u8> {
     prefix
         .iter()
-        .cloned()
-        .chain(socket_addr_to_vec(peer).iter().cloned())
-        .chain(header.dcid.iter().cloned())
+        .copied()
+        .chain(socket_addr_to_vec(peer).iter().copied())
+        .chain(header.dcid.iter().copied())
         .collect()
 }
 
@@ -1282,4 +1342,151 @@ fn validate_token<'a>(
         .strip_prefix(prefix)
         .and_then(|token| token.strip_prefix(socket_addr_to_vec(peer).as_slice()))
         .map(quiche::ConnectionId::from_ref)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[tokio::test]
+    async fn negotiation_and_retry_preserve_datagram_identity() -> io::Result<()> {
+        let mut settings = Settings::default();
+        settings.listen_protocols.quic = Some(crate::settings::QuicSettings::builder().build());
+        let demux = TlsDemux::new(&settings, &crate::settings::TlsHostsSettings::default())?;
+        let mut mux = QuicMultiplexer::new(
+            Arc::new(settings),
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+            Arc::new(std::sync::RwLock::new(demux)),
+            Arc::new(AtomicU64::new(0)),
+        )?;
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let peer_addr = peer.local_addr()?;
+        let mux_addr = mux.socket.local_addr()?;
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(io::Error::other)?;
+        config
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .map_err(io::Error::other)?;
+        let mut conn = quiche::connect(
+            Some("example.org"),
+            &quiche::ConnectionId::from_ref(&[0x42; quiche::MAX_CONN_ID_LEN]),
+            peer_addr,
+            mux_addr,
+            &mut config,
+        )
+        .map_err(io::Error::other)?;
+        peer.writable().await?;
+        flush_pending_data(&mut conn, &peer, &log_utils::IdChain::empty())?;
+        let mut packet = vec![0; net_utils::MAX_UDP_PAYLOAD_SIZE];
+        let (n, source) =
+            tokio::time::timeout(Duration::from_secs(5), mux.socket.recv_from(&mut packet))
+                .await??;
+        if source != peer_addr {
+            return Err(io::Error::other("Initial datagram source changed"));
+        }
+        packet.truncate(n);
+        let initial = quiche::Header::from_slice(&mut packet, quiche::MAX_CONN_ID_LEN)
+            .map_err(io::Error::other)?;
+        mux.socket.writable().await?;
+        let mut response = vec![0; net_utils::MAX_UDP_PAYLOAD_SIZE];
+
+        packet[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        peer.send_to(&packet, mux_addr).await?;
+        mux.socket.readable().await?;
+        if mux.read_udp_socket()?.is_some() {
+            return Err(io::Error::other(
+                "Unsupported version established a connection",
+            ));
+        }
+        let (n, source) =
+            tokio::time::timeout(Duration::from_secs(5), peer.recv_from(&mut response)).await??;
+        let negotiated = quiche::Header::from_slice(&mut response[..n], quiche::MAX_CONN_ID_LEN)
+            .map_err(io::Error::other)?;
+        if source != mux_addr
+            || negotiated.ty != quiche::Type::VersionNegotiation
+            || negotiated.scid != initial.dcid
+            || negotiated.dcid != initial.scid
+            || !negotiated
+                .versions
+                .as_ref()
+                .is_some_and(|versions| versions.contains(&quiche::PROTOCOL_VERSION))
+        {
+            return Err(io::Error::other(format!(
+                "Invalid version negotiation: {negotiated:?}"
+            )));
+        }
+
+        packet[1..5].copy_from_slice(&quiche::PROTOCOL_VERSION.to_be_bytes());
+        peer.send_to(&packet, mux_addr).await?;
+        mux.socket.readable().await?;
+        if mux.read_udp_socket()?.is_some() {
+            return Err(io::Error::other(
+                "Tokenless Initial established a connection",
+            ));
+        }
+        let (n, source) =
+            tokio::time::timeout(Duration::from_secs(5), peer.recv_from(&mut response)).await??;
+        let retry = quiche::Header::from_slice(&mut response[..n], quiche::MAX_CONN_ID_LEN)
+            .map_err(io::Error::other)?;
+        if source != mux_addr
+            || retry.ty != quiche::Type::Retry
+            || retry.dcid != initial.scid
+            || retry.scid.len() != quiche::MAX_CONN_ID_LEN
+            || retry.token.as_deref()
+                != Some(mint_token(&initial, &mux.token_prefix, &peer_addr).as_slice())
+        {
+            return Err(io::Error::other(format!(
+                "Invalid stateless retry: {retry:?}"
+            )));
+        }
+        if !mux.connections.is_empty() || !mux.deadlines.is_empty() {
+            return Err(io::Error::other(
+                "Stateless packets retained connection state",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn request_headers_preserve_stream_and_reject_invalid_names() {
+        let request = QuicSocket::on_request(
+            7,
+            vec![
+                h3::Header::new(b":method", b"GET"),
+                h3::Header::new(b":scheme", b"https"),
+                h3::Header::new(b":authority", b"example.org"),
+                h3::Header::new(b":path", b"/path?q=1"),
+                h3::Header::new(b"x-test", b"retained"),
+            ],
+        );
+        assert!(matches!(request, Ok(QuicSocketEvent::Request(7, headers))
+            if headers.version == http::Version::HTTP_3
+                && headers.method == http::Method::GET
+                && headers.uri == "https://example.org/path?q=1"
+                && headers.headers.get("x-test") == Some(&http::HeaderValue::from_static("retained"))));
+        let invalid = QuicSocket::on_request(7, vec![h3::Header::new(b"X-Test", b"value")]);
+        assert!(invalid.is_err_and(|error| error.kind() == ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn retry_token_preserves_connection_id_and_binds_peer() {
+        let prefix = [0x42; TOKEN_PREFIX_SIZE];
+        let dcid = [1, 2, 3, 4];
+        for peer in [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 443)),
+        ] {
+            let mut token = prefix.to_vec();
+            token.extend(socket_addr_to_vec(&peer));
+            token.extend_from_slice(&dcid);
+            let id = validate_token(&prefix, &peer, &token);
+            assert_eq!(id.as_ref().map(AsRef::as_ref), Some(dcid.as_slice()));
+            let other_peer = SocketAddr::new(peer.ip(), 444);
+            assert!(validate_token(&prefix, &other_peer, &token).is_none());
+            assert!(validate_token(&[0; TOKEN_PREFIX_SIZE], &peer, &token).is_none());
+            for end in 0..TOKEN_PREFIX_SIZE + socket_addr_to_vec(&peer).len() {
+                assert!(validate_token(&prefix, &peer, &token[..end]).is_none());
+            }
+        }
+    }
 }

@@ -10,11 +10,11 @@ const INITIAL_RESPONSE_HEADERS_BUFFER_SIZE: usize = 32;
 const MAX_RESPONSE_HEADERS_NUM: usize = 128;
 const ENCODED_CHUNK_SUFFIX: &str = "\r\n";
 
+type ForwardedPipe = (Box<dyn pipe::Source>, Box<dyn pipe::Sink>);
+
 /// Wrap the `stream` with a non-CONNECT request into a wrapper which forwards the request
 /// to a peer as a plain HTTP/1 one
-pub(crate) fn into_forwarded(
-    stream: Box<dyn http_codec::Stream>,
-) -> io::Result<(Box<dyn pipe::Source>, Box<dyn pipe::Sink>)> {
+pub fn into_forwarded(stream: Box<dyn http_codec::Stream>) -> io::Result<ForwardedPipe> {
     let (request, respond) = stream.split();
     let method = request.request().method.clone();
     let version = request.request().version;
@@ -22,7 +22,11 @@ pub(crate) fn into_forwarded(
     let (serialized_request, body_length) = match serialize_request(request.request()) {
         Ok(x) => x,
         Err(e) => {
-            let _ = respond.send_bad_response(http::StatusCode::BAD_REQUEST, vec![]);
+            if let Err(response_error) =
+                respond.send_bad_response(http::StatusCode::BAD_REQUEST, vec![])
+            {
+                debug!("Failed to send bad response: {response_error}");
+            }
             return Err(e);
         }
     };
@@ -60,7 +64,7 @@ struct ForwardedStreamSource {
     id: log_utils::IdChain<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum BodyLength {
     Determined(u64),
     Chunked,
@@ -144,7 +148,6 @@ impl pipe::Source for ForwardedStreamSource {
             SourceState::Done => return Ok(pipe::Data::Eof),
         }
 
-        assert!(matches!(self.state, SourceState::TransferringBody(_)));
         self.read_body().await
     }
 
@@ -167,9 +170,10 @@ impl pipe::Source for ForwardedStreamSource {
 
 impl ForwardedStreamSource {
     fn on_read_request(&mut self) -> io::Result<pipe::Data> {
-        let state = match std::mem::replace(&mut self.state, SourceState::Done) {
-            SourceState::WantSendRequest(x) => x,
-            _ => unreachable!(),
+        let SourceState::WantSendRequest(state) =
+            std::mem::replace(&mut self.state, SourceState::Done)
+        else {
+            return Err(io::Error::other("Invalid state"));
         };
 
         self.skip_consume_bytes = state.serialized_request.len();
@@ -186,17 +190,17 @@ impl ForwardedStreamSource {
     }
 
     async fn read_body(&mut self) -> io::Result<pipe::Data> {
-        let mut state = match std::mem::replace(&mut self.state, SourceState::Done) {
-            SourceState::TransferringBody(x) => x,
-            _ => unreachable!(),
+        let SourceState::TransferringBody(mut state) =
+            std::mem::replace(&mut self.state, SourceState::Done)
+        else {
+            return Err(io::Error::other("Invalid state"));
         };
 
         let result = state.source.read().await?;
 
         self.state = SourceState::TransferringBody(state);
-        let state = match &mut self.state {
-            SourceState::TransferringBody(x) => x,
-            _ => unreachable!(),
+        let SourceState::TransferringBody(state) = &mut self.state else {
+            return Err(io::Error::other("Invalid state"));
         };
 
         match (result, &state.body_length) {
@@ -205,17 +209,14 @@ impl ForwardedStreamSource {
                 state.sent_bytes += to_send;
                 Ok(pipe::Data::Chunk(bytes.split_to(to_send as usize)))
             }
-            (pipe::Data::Chunk(_) | pipe::Data::Eof, BodyLength::Determined(_)) => {
+            (pipe::Data::Chunk(_) | pipe::Data::Eof, BodyLength::Determined(_))
+            | (pipe::Data::Eof, BodyLength::Chunked) => {
                 self.state = SourceState::Done;
                 Ok(pipe::Data::Eof)
             }
             (pipe::Data::Chunk(bytes), BodyLength::Chunked) => {
                 state.sent_bytes += bytes.len() as u64;
                 Ok(pipe::Data::Chunk(bytes))
-            }
-            (pipe::Data::Eof, BodyLength::Chunked) => {
-                self.state = SourceState::Done;
-                Ok(pipe::Data::Eof)
             }
         }
     }
@@ -234,11 +235,14 @@ impl pipe::Sink for ForwardedStreamSink {
                 Err(e) if matches!(self.state, SinkState::WaitingResponse(_)) => {
                     match std::mem::replace(&mut self.state, SinkState::Idle) {
                         SinkState::WaitingResponse(x) => {
-                            let _ = x
+                            if let Err(response_error) = x
                                 .respond
-                                .send_bad_response(http::StatusCode::BAD_GATEWAY, vec![]);
+                                .send_bad_response(http::StatusCode::BAD_GATEWAY, vec![])
+                            {
+                                debug!("Failed to send bad response: {response_error}");
+                            }
                         }
-                        _ => unreachable!(),
+                        _ => return Err(io::Error::other("Invalid state")),
                     }
                     Err(e)
                 }
@@ -295,9 +299,8 @@ impl pipe::Sink for ForwardedStreamSink {
 
 impl ForwardedStreamSink {
     fn on_response_headers_chunk(&mut self, data: Bytes) -> io::Result<Bytes> {
-        let state = match &mut self.state {
-            SinkState::WaitingResponse(x) => x,
-            _ => unreachable!(),
+        let SinkState::WaitingResponse(state) = &mut self.state else {
+            return Err(io::Error::other("Invalid state"));
         };
 
         let ((response, body_length), tail) = match state.parse_response(data, &self.id)? {
@@ -310,9 +313,9 @@ impl ForwardedStreamSink {
             return Ok(tail);
         }
 
-        let state = match std::mem::replace(&mut self.state, SinkState::Idle) {
-            SinkState::WaitingResponse(x) => x,
-            _ => unreachable!(),
+        let SinkState::WaitingResponse(state) = std::mem::replace(&mut self.state, SinkState::Idle)
+        else {
+            return Err(io::Error::other("Invalid state"));
         };
 
         let sink = state.respond.send_response(
@@ -322,15 +325,15 @@ impl ForwardedStreamSink {
 
         self.state = match body_length {
             Some(BodyLength::Chunked) => SinkState::WaitingChunkPrefix(SinkWaitingChunkPrefix {
-                buffer: Default::default(),
+                buffer: BytesMut::default(),
                 sink: sink.into_pipe_sink(),
             }),
             None | Some(BodyLength::Determined(_)) => {
                 SinkState::TransferringBodyNonEncoded(SinkTransferringBodyNonEncoded {
                     sink: sink.into_pipe_sink(),
-                    body_length: body_length.map(|x| match x {
-                        BodyLength::Determined(x) => x,
-                        BodyLength::Chunked => unreachable!(),
+                    body_length: body_length.and_then(|x| match x {
+                        BodyLength::Determined(x) => Some(x),
+                        BodyLength::Chunked => None,
                     }),
                     sent_bytes: 0,
                 })
@@ -343,9 +346,8 @@ impl ForwardedStreamSink {
 
     fn on_non_encoded_chunk(&mut self, mut data: Bytes) -> io::Result<Bytes> {
         log_id!(trace, self.id, "Non encoded chunk: {} bytes", data.len());
-        let state = match &mut self.state {
-            SinkState::TransferringBodyNonEncoded(x) => x,
-            _ => unreachable!(),
+        let SinkState::TransferringBodyNonEncoded(state) = &mut self.state else {
+            return Err(io::Error::other("Invalid state"));
         };
 
         let to_send = match state.body_length {
@@ -367,8 +369,9 @@ impl ForwardedStreamSink {
         state.sent_bytes += (chunk_size - unsent.len()) as u64;
 
         if Some(state.sent_bytes) == state.body_length {
-            assert!(unsent.is_empty());
-            assert_eq!(data.len(), to_send);
+            if !unsent.is_empty() || data.len() != to_send {
+                return Err(io::Error::other("Invalid response body length"));
+            }
             state.sink.eof()?;
         }
 
@@ -376,9 +379,8 @@ impl ForwardedStreamSink {
     }
 
     fn on_encoded_chunk_prefix(&mut self, data: Bytes) -> io::Result<Bytes> {
-        let state = match &mut self.state {
-            SinkState::WaitingChunkPrefix(x) => x,
-            _ => unreachable!(),
+        let SinkState::WaitingChunkPrefix(state) = &mut self.state else {
+            return Err(io::Error::other("Invalid state"));
         };
 
         let mut data = if state.buffer.is_empty() {
@@ -404,18 +406,18 @@ impl ForwardedStreamSink {
 
         if chunk_size == 0 {
             self.state = SinkState::WaitingChunkSuffix(SinkWaitingChunkSuffix {
-                buffer: Default::default(),
+                buffer: BytesMut::default(),
                 terminating_chunk: true,
                 sink: match std::mem::replace(&mut self.state, SinkState::Idle) {
                     SinkState::WaitingChunkPrefix(x) => x.sink,
-                    _ => unreachable!(),
+                    _ => return Err(io::Error::other("Invalid state")),
                 },
             });
         } else {
             self.state = SinkState::TransferringBodyChunked(SinkTransferringBodyChunked {
                 sink: match std::mem::replace(&mut self.state, SinkState::Idle) {
                     SinkState::WaitingChunkPrefix(x) => x.sink,
-                    _ => unreachable!(),
+                    _ => return Err(io::Error::other("Invalid state")),
                 },
                 remaining_chunk_size: Some(chunk_size),
             });
@@ -426,19 +428,22 @@ impl ForwardedStreamSink {
     }
 
     fn on_encoded_chunk(&mut self, mut data: Bytes) -> io::Result<Bytes> {
-        let mut state = match std::mem::replace(&mut self.state, SinkState::Idle) {
-            SinkState::TransferringBodyChunked(x) => x,
-            _ => unreachable!(),
+        let SinkState::TransferringBodyChunked(mut state) =
+            std::mem::replace(&mut self.state, SinkState::Idle)
+        else {
+            return Err(io::Error::other("Invalid state"));
         };
 
-        let to_send =
-            std::cmp::min(data.len() as u64, state.remaining_chunk_size.unwrap()) as usize;
+        let remaining_chunk_size = state
+            .remaining_chunk_size
+            .ok_or_else(|| io::Error::other("Missing encoded chunk size"))?;
+        let to_send = std::cmp::min(data.len() as u64, remaining_chunk_size) as usize;
         let unsent = state.sink.write(data.slice(..to_send))?;
 
         let remaining = state
             .remaining_chunk_size
             .take()
-            .unwrap()
+            .ok_or_else(|| io::Error::other("Missing encoded chunk size"))?
             .saturating_sub(to_send as u64);
         log_id!(
             trace,
@@ -462,9 +467,10 @@ impl ForwardedStreamSink {
     }
 
     fn on_encoded_chunk_suffix(&mut self, mut data: Bytes) -> io::Result<Bytes> {
-        let mut state = match std::mem::replace(&mut self.state, SinkState::Idle) {
-            SinkState::WaitingChunkSuffix(x) => x,
-            _ => unreachable!(),
+        let SinkState::WaitingChunkSuffix(mut state) =
+            std::mem::replace(&mut self.state, SinkState::Idle)
+        else {
+            return Err(io::Error::other("Invalid state"));
         };
 
         let suffix = if state.buffer.is_empty() {
@@ -496,7 +502,7 @@ impl ForwardedStreamSink {
             state.sink.eof()?;
         } else {
             self.state = SinkState::WaitingChunkPrefix(SinkWaitingChunkPrefix {
-                buffer: Default::default(),
+                buffer: BytesMut::default(),
                 sink: state.sink,
             });
         }
@@ -505,13 +511,14 @@ impl ForwardedStreamSink {
     }
 }
 
+type ParsedResponse = (Option<(ResponseHeaders, Option<BodyLength>)>, Bytes);
+
 impl SinkWaitingResponse {
-    #[allow(clippy::type_complexity)]
     fn parse_response(
         &mut self,
         data: Bytes,
         log_id: &log_utils::IdChain<u64>,
-    ) -> io::Result<(Option<(ResponseHeaders, Option<BodyLength>)>, Bytes)> {
+    ) -> io::Result<ParsedResponse> {
         let mut data = if self.headers_buffer.is_empty() {
             data
         } else {
@@ -526,7 +533,7 @@ impl SinkWaitingResponse {
             match response.parse(data.as_ref()) {
                 Ok(httparse::Status::Complete(pos)) => {
                     log_id!(trace, log_id, "Received response: {:?}", response);
-                    return Ok((Some(self.convert_response(response)?), data.split_off(pos)));
+                    return Ok((Some(self.convert_response(&response)?), data.split_off(pos)));
                 }
                 Ok(httparse::Status::Partial) => {
                     self.headers_buffer = BytesMut::from(data.as_ref());
@@ -536,24 +543,29 @@ impl SinkWaitingResponse {
                     if parse_headers_buffer.len() < MAX_RESPONSE_HEADERS_NUM =>
                 {
                     parse_headers_buffer
-                        .resize(2 * parse_headers_buffer.len(), httparse::EMPTY_HEADER)
+                        .resize(2 * parse_headers_buffer.len(), httparse::EMPTY_HEADER);
                 }
-                Err(e) => return Err(io::Error::other(format!("Failed to parse response: {}", e))),
+                Err(e) => return Err(io::Error::other(format!("Failed to parse response: {e}"))),
             }
         }
     }
 
     fn convert_response(
         &self,
-        response: httparse::Response,
+        response: &httparse::Response<'_, '_>,
     ) -> io::Result<(ResponseHeaders, Option<BodyLength>)> {
         let mut builder = http::response::Response::builder()
             .version(self.request_version)
-            .status(response.code.unwrap());
+            .status(
+                response
+                    .code
+                    .ok_or_else(|| io::Error::other("Missing response status"))?,
+            );
         let mut body_length = None;
-        let mut drop_headers =
-            HashSet::from(["proxy-connection", "keep-alive", "upgrade"].map(|h| h.to_string()));
-        for h in response.headers {
+        let mut drop_headers = HashSet::from(
+            ["proxy-connection", "keep-alive", "upgrade"].map(std::string::ToString::to_string),
+        );
+        for h in response.headers.iter() {
             match (h.name.to_ascii_lowercase().as_str(), self.request_version) {
                 (x, _) if drop_headers.contains(x) => (),
                 ("connection", _) => {
@@ -566,7 +578,7 @@ impl SinkWaitingResponse {
                     }
                 }
                 ("transfer-encoding", http::Version::HTTP_2 | http::Version::HTTP_3) => {
-                    if h.value == "chunked".as_bytes() {
+                    if h.value == b"chunked" {
                         body_length = Some(BodyLength::Chunked);
                     }
                     drop_headers.insert("content-length".to_string());
@@ -591,7 +603,7 @@ impl SinkWaitingResponse {
                                 })?,
                         ));
                     }
-                    builder = builder.header(h.name.trim_end(), h.value)
+                    builder = builder.header(h.name.trim_end(), h.value);
                 }
             }
         }
@@ -606,7 +618,7 @@ impl SinkWaitingResponse {
 
         let response = builder
             .body(())
-            .map_err(|e| io::Error::other(format!("Invalid response: {}", e)))?
+            .map_err(|e| io::Error::other(format!("Invalid response: {e}")))?
             .into_parts()
             .0;
 
@@ -614,21 +626,18 @@ impl SinkWaitingResponse {
     }
 }
 
-fn version_major_digit(v: http::Version) -> u32 {
+const fn version_major_digit(v: http::Version) -> u32 {
     match v {
         http::Version::HTTP_09 => 0,
         _ => 1,
     }
 }
 
-fn version_minor_digit(v: http::Version) -> u32 {
+fn version_minor_digit(v: http::Version) -> io::Result<u32> {
     match v {
-        http::Version::HTTP_09 => 0,
-        http::Version::HTTP_10 => 0,
-        http::Version::HTTP_11 => 1,
-        http::Version::HTTP_2 => 1,
-        http::Version::HTTP_3 => 1,
-        _ => unreachable!(),
+        http::Version::HTTP_09 | http::Version::HTTP_10 => Ok(0),
+        http::Version::HTTP_11 | http::Version::HTTP_2 | http::Version::HTTP_3 => Ok(1),
+        _ => Err(io::Error::other("Unsupported HTTP version")),
     }
 }
 
@@ -638,16 +647,16 @@ fn serialize_request(request: &RequestHeaders) -> io::Result<(Bytes, BodyLength)
         format!(
             "{} {} HTTP/{}.{}\r\n",
             request.method.as_str(),
-            if request.method != http::Method::OPTIONS {
+            if request.method == http::Method::OPTIONS {
+                "*"
+            } else {
                 request
                     .uri
                     .path_and_query()
-                    .map_or(request.uri.path(), |x| x.as_str())
-            } else {
-                "*"
+                    .map_or_else(|| request.uri.path(), |x| x.as_str())
             },
             version_major_digit(request.version),
-            version_minor_digit(request.version),
+            version_minor_digit(request.version)?,
         )
         .as_bytes(),
     );
@@ -660,17 +669,15 @@ fn serialize_request(request: &RequestHeaders) -> io::Result<(Bytes, BodyLength)
     let mut body_length = None;
     for (name, value) in &request.headers {
         match name.as_str() {
-            "proxy-authorization" => (),
-            "proxy-connection" => (),
+            "proxy-authorization" | "proxy-connection" => (),
             "host" => {
-                if !host_inserted {
-                    host_inserted = true;
-                    serialized.put("host: ".as_bytes());
-                    serialized.put(target_host.as_str().as_bytes());
-                    serialized.put("\r\n".as_bytes());
-                } else {
+                if host_inserted {
                     return Err(io::Error::other("Request has multiple Host headers"));
                 }
+                host_inserted = true;
+                serialized.put_slice(b"host: ");
+                serialized.put(target_host.as_str().as_bytes());
+                serialized.put_slice(b"\r\n");
             }
             name => {
                 match (name, &body_length) {
@@ -685,7 +692,7 @@ fn serialize_request(request: &RequestHeaders) -> io::Result<(Bytes, BodyLength)
                                 .map_err(|_| {
                                     io::Error::other("Invalid Content-Length header value")
                                 })?,
-                        ))
+                        ));
                     }
                     ("content-length", Some(BodyLength::Determined(_))) => {
                         return Err(io::Error::other(
@@ -693,25 +700,25 @@ fn serialize_request(request: &RequestHeaders) -> io::Result<(Bytes, BodyLength)
                         ))
                     }
                     ("transfer-encoding", _) if value == "chunked" => {
-                        body_length = Some(BodyLength::Chunked)
+                        body_length = Some(BodyLength::Chunked);
                     }
                     _ => (),
                 }
 
-                serialized.put(format!("{}: ", name).as_bytes());
+                serialized.put(format!("{name}: ").as_bytes());
                 serialized.put(value.as_bytes());
-                serialized.put("\r\n".as_bytes());
+                serialized.put_slice(b"\r\n");
             }
         }
     }
 
     if !host_inserted {
-        serialized.put("host: ".as_bytes());
+        serialized.put_slice(b"host: ");
         serialized.put(target_host.as_str().as_bytes());
-        serialized.put("\r\n".as_bytes());
+        serialized.put_slice(b"\r\n");
     }
 
-    serialized.put("\r\n".as_bytes());
+    serialized.put_slice(b"\r\n");
 
     body_length = if request.method == http::Method::HEAD {
         Some(BodyLength::Determined(0))
@@ -726,4 +733,63 @@ fn serialize_request(request: &RequestHeaders) -> io::Result<(Bytes, BodyLength)
         serialized.freeze(),
         body_length.unwrap_or(BodyLength::Determined(0)),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipe::Source;
+
+    #[test]
+    fn forwarded_request_bytes_and_body_length_are_unchanged() {
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .version(http::Version::HTTP_2)
+            .uri("https://example.test/path?q=1")
+            .header("proxy-authorization", "Basic secret")
+            .header("content-length", "4")
+            .body(())
+            .map_err(io::Error::other)
+            .and_then(|request| serialize_request(&request.into_parts().0));
+        assert!(
+            matches!(request, Ok((packet, BodyLength::Determined(4))) if packet == b"POST /path?q=1 HTTP/1.1\r\ncontent-length: 4\r\nhost: example.test\r\n\r\n".as_slice())
+        );
+    }
+
+    struct PendingSource;
+
+    #[async_trait]
+    impl pipe::Source for PendingSource {
+        fn id(&self) -> log_utils::IdChain<u64> {
+            log_utils::IdChain::empty()
+        }
+
+        async fn read(&mut self) -> io::Result<pipe::Data> {
+            futures::future::pending().await
+        }
+
+        fn consume(&mut self, _size: usize) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_body_read_keeps_the_terminal_source_state() {
+        let mut source = ForwardedStreamSource {
+            state: SourceState::TransferringBody(SourceTransferringBody {
+                source: Box::new(PendingSource),
+                body_length: BodyLength::Chunked,
+                sent_bytes: 0,
+            }),
+            skip_consume_bytes: 0,
+            id: log_utils::IdChain::empty(),
+        };
+        {
+            let read = source.read();
+            tokio::pin!(read);
+            assert!(futures::poll!(read.as_mut()).is_pending());
+        }
+        assert!(matches!(source.state, SourceState::Done));
+        assert!(matches!(source.read().await, Ok(pipe::Data::Eof)));
+    }
 }

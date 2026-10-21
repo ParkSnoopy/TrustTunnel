@@ -1,3 +1,5 @@
+//! Derive macros for field getters and runtime access to documentation.
+
 mod getter;
 mod rt_doc;
 
@@ -5,6 +7,8 @@ use proc_macro::TokenStream;
 
 /// Collect docs for each identifier of the struct or enum and generate
 /// static methods to get the docs in runtime.
+///
+/// Unsupported items produce a compile error rather than panicking.
 ///
 /// ```
 /// use macros::RuntimeDoc;
@@ -45,10 +49,12 @@ use proc_macro::TokenStream;
 /// ```
 #[proc_macro_derive(RuntimeDoc)]
 pub fn parse_rt_doc(input: TokenStream) -> TokenStream {
-    rt_doc::derive(input)
+    rt_doc::derive(input.into()).into()
 }
 
 /// Generate getters for each field of the struct.
+///
+/// Only named-field structs are supported; other items produce a compile error.
 ///
 /// ```
 /// use macros::Getter;
@@ -78,5 +84,5 @@ pub fn parse_rt_doc(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_derive(Getter)]
 pub fn parse_getter(input: TokenStream) -> TokenStream {
-    getter::derive(input)
+    getter::derive(input.into()).into()
 }

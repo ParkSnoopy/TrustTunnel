@@ -9,16 +9,18 @@ use std::io::{self, ErrorKind};
 /// - 10: 4 bytes (values 0-1073741823)
 /// - 11: 8 bytes (values 0-2^62-1)
 ///
-/// Returns an error if the value is too large (> 2^62-1).
+/// # Errors
+///
+/// Returns [`DeepLinkError::VarintOverflow`] if the value is too large (> 2^62-1).
 pub fn encode_varint(value: u64) -> Result<Vec<u8>> {
     if value <= 0x3F {
         Ok(vec![value as u8])
     } else if value <= 0x3FFF {
         Ok(((value | 0x4000) as u16).to_be_bytes().to_vec())
-    } else if value <= 0x3FFFFFFF {
-        Ok(((value | 0x80000000) as u32).to_be_bytes().to_vec())
-    } else if value <= 0x3FFFFFFFFFFFFFFF {
-        Ok((value | 0xC000000000000000).to_be_bytes().to_vec())
+    } else if value <= 0x3FFF_FFFF {
+        Ok(((value | 0x8000_0000) as u32).to_be_bytes().to_vec())
+    } else if value <= 0x3FFF_FFFF_FFFF_FFFF {
+        Ok((value | 0xC000_0000_0000_0000).to_be_bytes().to_vec())
     } else {
         Err(DeepLinkError::VarintOverflow(value))
     }
@@ -26,7 +28,12 @@ pub fn encode_varint(value: u64) -> Result<Vec<u8>> {
 
 /// Decode a TLS/QUIC variable-length integer from data at the given offset.
 ///
-/// Returns (value, new_offset) on success.
+/// Returns (value, `new_offset`) on success.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::UnexpectedEof`] if the offset is outside the data or
+/// the encoded integer is truncated.
 pub fn decode_varint(data: &[u8], offset: usize) -> io::Result<(u64, usize)> {
     if offset >= data.len() {
         return Err(io::Error::new(
@@ -69,7 +76,7 @@ pub fn decode_varint(data: &[u8], offset: usize) -> io::Result<(u64, usize)> {
                 data[offset + 2],
                 data[offset + 3],
             ];
-            let value = u32::from_be_bytes(bytes) & 0x3FFFFFFF;
+            let value = u32::from_be_bytes(bytes) & 0x3FFF_FFFF;
             Ok((u64::from(value), offset + 4))
         }
         3 => {
@@ -90,7 +97,7 @@ pub fn decode_varint(data: &[u8], offset: usize) -> io::Result<(u64, usize)> {
                 data[offset + 6],
                 data[offset + 7],
             ];
-            let value = u64::from_be_bytes(bytes) & 0x3FFFFFFFFFFFFFFF;
+            let value = u64::from_be_bytes(bytes) & 0x3FFF_FFFF_FFFF_FFFF;
             Ok((value, offset + 8))
         }
         _ => unreachable!(),
@@ -100,94 +107,103 @@ pub fn decode_varint(data: &[u8], offset: usize) -> io::Result<(u64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::{prop_assert, prop_assert_eq};
+
+    type TestResult = proptest::test_runner::TestCaseResult;
 
     #[test]
-    fn test_encode_varint_1_byte() {
-        assert_eq!(encode_varint(0).unwrap(), vec![0x00]);
-        assert_eq!(encode_varint(37).unwrap(), vec![0x25]);
-        assert_eq!(encode_varint(63).unwrap(), vec![0x3F]);
+    fn test_encode_varint_1_byte() -> TestResult {
+        prop_assert_eq!(encode_varint(0)?, vec![0x00]);
+        prop_assert_eq!(encode_varint(37)?, vec![0x25]);
+        prop_assert_eq!(encode_varint(63)?, vec![0x3F]);
+        Ok(())
     }
 
     #[test]
-    fn test_encode_varint_2_bytes() {
-        assert_eq!(encode_varint(64).unwrap(), vec![0x40, 0x40]);
-        assert_eq!(encode_varint(1000).unwrap(), vec![0x43, 0xE8]);
-        assert_eq!(encode_varint(16383).unwrap(), vec![0x7F, 0xFF]);
+    fn test_encode_varint_2_bytes() -> TestResult {
+        prop_assert_eq!(encode_varint(64)?, vec![0x40, 0x40]);
+        prop_assert_eq!(encode_varint(1000)?, vec![0x43, 0xE8]);
+        prop_assert_eq!(encode_varint(16383)?, vec![0x7F, 0xFF]);
+        Ok(())
     }
 
     #[test]
-    fn test_encode_varint_4_bytes() {
-        assert_eq!(encode_varint(16384).unwrap(), vec![0x80, 0x00, 0x40, 0x00]);
-        assert_eq!(
-            encode_varint(1073741823).unwrap(),
-            vec![0xBF, 0xFF, 0xFF, 0xFF]
-        );
+    fn test_encode_varint_4_bytes() -> TestResult {
+        prop_assert_eq!(encode_varint(16384)?, vec![0x80, 0x00, 0x40, 0x00]);
+        prop_assert_eq!(encode_varint(1_073_741_823)?, vec![0xBF, 0xFF, 0xFF, 0xFF]);
+        Ok(())
     }
 
     #[test]
-    fn test_encode_varint_8_bytes() {
-        assert_eq!(
-            encode_varint(1073741824).unwrap(),
+    fn test_encode_varint_8_bytes() -> TestResult {
+        prop_assert_eq!(
+            encode_varint(1_073_741_824)?,
             vec![0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]
         );
-        assert_eq!(
-            encode_varint(0x3FFFFFFFFFFFFFFF).unwrap(),
+        prop_assert_eq!(
+            encode_varint(0x3FFF_FFFF_FFFF_FFFF)?,
             vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_encode_varint_too_large() {
-        let result = encode_varint(0x4000000000000000);
-        assert!(result.is_err());
+    fn test_encode_varint_too_large() -> TestResult {
+        let result = encode_varint(0x4000_0000_0000_0000);
+        prop_assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_decode_varint_1_byte() {
-        assert_eq!(decode_varint(&[0x25], 0).unwrap(), (37, 1));
-        assert_eq!(decode_varint(&[0x3F], 0).unwrap(), (63, 1));
+    fn test_decode_varint_1_byte() -> TestResult {
+        prop_assert_eq!(decode_varint(&[0x25], 0)?, (37, 1));
+        prop_assert_eq!(decode_varint(&[0x3F], 0)?, (63, 1));
+        Ok(())
     }
 
     #[test]
-    fn test_decode_varint_2_bytes() {
-        assert_eq!(decode_varint(&[0x40, 0x40], 0).unwrap(), (64, 2));
-        assert_eq!(decode_varint(&[0x7F, 0xFF], 0).unwrap(), (16383, 2));
+    fn test_decode_varint_2_bytes() -> TestResult {
+        prop_assert_eq!(decode_varint(&[0x40, 0x40], 0)?, (64, 2));
+        prop_assert_eq!(decode_varint(&[0x7F, 0xFF], 0)?, (16383, 2));
+        Ok(())
     }
 
     #[test]
-    fn test_decode_varint_4_bytes() {
-        assert_eq!(
-            decode_varint(&[0x80, 0x00, 0x40, 0x00], 0).unwrap(),
-            (16384, 4)
+    fn test_decode_varint_4_bytes() -> TestResult {
+        prop_assert_eq!(decode_varint(&[0x80, 0x00, 0x40, 0x00], 0)?, (16384, 4));
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_varint_8_bytes() -> TestResult {
+        prop_assert_eq!(
+            decode_varint(&[0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00], 0)?,
+            (1_073_741_824, 8)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_decode_varint_8_bytes() {
-        assert_eq!(
-            decode_varint(&[0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00], 0).unwrap(),
-            (1073741824, 8)
-        );
-    }
-
-    #[test]
-    fn test_decode_varint_at_offset() {
+    fn test_decode_varint_at_offset() -> TestResult {
         let data = vec![0xFF, 0x25, 0x00];
-        assert_eq!(decode_varint(&data, 1).unwrap(), (37, 2));
+        prop_assert_eq!(decode_varint(&data, 1)?, (37, 2));
+        Ok(())
     }
 
     #[test]
-    fn test_decode_varint_truncated() {
+    fn test_decode_varint_truncated() -> TestResult {
         let result = decode_varint(&[0x40], 0);
-        assert!(result.is_err());
+        prop_assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_encode_decode_roundtrip() {
-        for value in [0, 1, 63, 64, 16383, 16384, 1073741823, 1073741824] {
-            let encoded = encode_varint(value).unwrap();
-            let (decoded, _) = decode_varint(&encoded, 0).unwrap();
-            assert_eq!(decoded, value);
+    fn test_encode_decode_roundtrip() -> TestResult {
+        for value in [0, 1, 63, 64, 16383, 16384, 1_073_741_823, 1_073_741_824] {
+            let encoded = encode_varint(value)?;
+            let (decoded, _) = decode_varint(&encoded, 0)?;
+            prop_assert_eq!(decoded, value);
         }
+        Ok(())
     }
 }

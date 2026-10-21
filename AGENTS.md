@@ -181,6 +181,7 @@ protocol/deep-link format, library API) when relevant.
    **Rationale**: consistent formatting across the workspace.
 
 2. Clippy MUST pass with `-D warnings` (all warnings are errors).
+   Keep lint policy and test coverage intact during remediation.
 
    **Rationale**: catches common mistakes and enforces idiomatic Rust.
 
@@ -202,6 +203,11 @@ protocol/deep-link format, library API) when relevant.
 
    **Rationale**: consistent documentation formatting.
 
+5. Define common package metadata in root `[workspace.package]` and inherit it in member manifests with `<field>.workspace = true`.
+   Keep crate-specific values local.
+
+   **Rationale**: one authoritative definition prevents workspace metadata drift.
+
 ### III. Testing Discipline
 
 1. Unit tests MUST live next to their source module in `#[cfg(test)]` blocks.
@@ -209,7 +215,7 @@ protocol/deep-link format, library API) when relevant.
    **Rationale**: keeps tests close to the code they verify.
 
 2. Integration tests MUST be placed in `lib/tests/`. Shared test helpers live
-   in `lib/tests/common/mod.rs`.
+   in `lib/tests/common/`.
 
    **Rationale**: centralized integration test infrastructure with reusable
    endpoint setup, TLS connection helpers, and HTTP/3 session management.

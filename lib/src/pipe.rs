@@ -18,7 +18,7 @@ macro_rules! log_dir {
     };
 }
 
-pub(crate) enum Data {
+pub enum Data {
     /// Data chunk
     Chunk(Bytes),
     /// No more data will be transmitted in that direction
@@ -27,7 +27,7 @@ pub(crate) enum Data {
 
 /// An abstract interface for a receiver implementation
 #[async_trait]
-pub(crate) trait Source: Send {
+pub trait Source: Send {
     /// Get the request ID for logging
     fn id(&self) -> log_utils::IdChain<u64>;
 
@@ -41,7 +41,7 @@ pub(crate) trait Source: Send {
 
 /// An abstract interface for a transmitter implementation
 #[async_trait]
-pub(crate) trait Sink: Send {
+pub trait Sink: Send {
     /// Get the request ID for logging
     fn id(&self) -> log_utils::IdChain<u64>;
 
@@ -78,8 +78,8 @@ pub(crate) trait Sink: Send {
     }
 }
 
-#[derive(Copy, Clone, PartialEq)]
-pub(crate) enum SimplexDirection {
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum SimplexDirection {
     /// Packet goes from a peer to a client
     Incoming,
     /// Packet goes from a client to a peer
@@ -87,7 +87,7 @@ pub(crate) enum SimplexDirection {
 }
 
 /// Feeds packets received from [`Source`] to [`Sink`] doing some flow control
-pub(crate) struct SimplexPipe<F> {
+pub struct SimplexPipe<F> {
     source: Box<dyn Source>,
     sink: Box<dyn Sink>,
     update_metrics: F,
@@ -96,12 +96,12 @@ pub(crate) struct SimplexPipe<F> {
     last_activity: Instant,
 }
 
-pub(crate) struct Error<T> {
+pub struct Error<T> {
     pub id: T,
     pub io: io::Error,
 }
 
-pub(crate) enum ExchangeOnceStatus<T> {
+pub enum ExchangeOnceStatus<T> {
     TimedOut(T),
     Finished(T),
 }
@@ -109,8 +109,8 @@ pub(crate) enum ExchangeOnceStatus<T> {
 impl Display for Data {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Data::Chunk(x) => write!(f, "Chunk({} bytes)", x.len()),
-            Data::Eof => write!(f, "Eof"),
+            Self::Chunk(x) => write!(f, "Chunk({} bytes)", x.len()),
+            Self::Eof => write!(f, "Eof"),
         }
     }
 }
@@ -118,8 +118,8 @@ impl Display for Data {
 impl Display for SimplexDirection {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            SimplexDirection::Incoming => write!(f, "<--"),
-            SimplexDirection::Outgoing => write!(f, "-->"),
+            Self::Incoming => write!(f, "<--"),
+            Self::Outgoing => write!(f, "-->"),
         }
     }
 }
@@ -135,7 +135,7 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
             source,
             sink,
             update_metrics,
-            pending_chunk: Default::default(),
+            pending_chunk: None,
             direction,
             last_activity: Instant::now(),
         }
@@ -216,7 +216,7 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
     }
 }
 
-pub(crate) struct DuplexPipe<F> {
+pub struct DuplexPipe<F> {
     left_pipe: SimplexPipe<F>,
     right_pipe: SimplexPipe<F>,
 }
@@ -262,8 +262,10 @@ impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
         futures::pin_mut!(f2);
 
         match future::try_select(f1, f2).await {
-            Ok(Either::Left((ExchangeOnceStatus::Finished(dir), another)))
-            | Ok(Either::Right((ExchangeOnceStatus::Finished(dir), another))) => {
+            Ok(
+                Either::Left((ExchangeOnceStatus::Finished(dir), another))
+                | Either::Right((ExchangeOnceStatus::Finished(dir), another)),
+            ) => {
                 log_dir!(trace, id, dir, "Pipe gracefully closed");
                 let ret = match another.await {
                     Ok(ExchangeOnceStatus::Finished(_)) => Ok(ExchangeOnceStatus::Finished(())),
@@ -278,11 +280,11 @@ impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
                 }
                 ret.map_err(|e| e.io)
             }
-            Ok(Either::Left((ExchangeOnceStatus::TimedOut(_), _)))
-            | Ok(Either::Right((ExchangeOnceStatus::TimedOut(_), _))) => {
-                Ok(ExchangeOnceStatus::TimedOut(()))
-            }
-            Err(Either::Left((e, _))) | Err(Either::Right((e, _))) => {
+            Ok(
+                Either::Left((ExchangeOnceStatus::TimedOut(_), _))
+                | Either::Right((ExchangeOnceStatus::TimedOut(_), _)),
+            ) => Ok(ExchangeOnceStatus::TimedOut(())),
+            Err(Either::Left((e, _)) | Either::Right((e, _))) => {
                 if e.io.kind() != ErrorKind::WouldBlock {
                     log_dir!(debug, id, e.id, "Error on pipe: {}", e.io);
                 }
@@ -292,6 +294,6 @@ impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
     }
 }
 
-fn io_to_pipe_error<T>(id: T, io: io::Error) -> Error<T> {
+const fn io_to_pipe_error<T>(id: T, io: io::Error) -> Error<T> {
     Error { id, io }
 }

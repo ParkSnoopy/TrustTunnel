@@ -13,28 +13,28 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
 
-pub(crate) const MAX_RAW_HEADERS_SIZE: usize = 1024;
-pub(crate) const MAX_HEADERS_NUM: usize = 32;
+pub const MAX_RAW_HEADERS_SIZE: usize = 1024;
+pub const MAX_HEADERS_NUM: usize = 32;
 
-pub(crate) struct Http1Codec<IO> {
+pub struct Http1Codec<IO> {
     state: State,
     transport_stream: IO,
-    /// Receives messages from [`StreamSink.download_tx`]
+    /// Receives messages from [`StreamSink::download_tx`]
     download_rx: mpsc::Receiver<Bytes>,
-    /// See [`StreamSink.download_tx`]
+    /// See [`StreamSink::download_tx`]
     download_tx: Option<mpsc::Sender<Bytes>>,
-    /// Waits notify from [`StreamSink.download_eof`]
+    /// Waits notify from [`StreamSink::download_eof`]
     download_eof: Arc<Notify>,
-    /// See [`StreamSource.upload_rx`]
+    /// See [`StreamSource::upload_rx`]
     upload_rx: Option<mpsc::Receiver<Bytes>>,
-    /// Sends messages to [`StreamSource.upload_rx`]
+    /// Sends messages to [`StreamSource::upload_rx`]
     upload_tx: mpsc::Sender<Bytes>,
     upload_buffer_size: usize,
     parent_id_chain: log_utils::IdChain<u64>,
     next_request_id: std::ops::RangeFrom<u64>,
 }
 
-pub(crate) enum DecodeStatus<Headers> {
+pub enum DecodeStatus<Headers> {
     Partial(BytesMut),
     Complete(Headers, BytesMut),
 }
@@ -60,15 +60,15 @@ struct Stream {
 struct StreamSource {
     request: RequestHeaders,
     client_address: IpAddr,
-    /// Receives messages from [`Http1Codec.upload_tx`]
+    /// Receives messages from [`Http1Codec::upload_tx`]
     upload_rx: mpsc::Receiver<Bytes>,
     id: log_utils::IdChain<u64>,
 }
 
 struct StreamSink {
-    /// Sends messages to [`Http1Codec.download_rx`]
+    /// Sends messages to [`Http1Codec::download_rx`]
     download_tx: Option<mpsc::Sender<Bytes>>,
-    /// Notifies [`Http1Codec.download_eof`]
+    /// Notifies [`Http1Codec::download_eof`]
     download_eof: Arc<Notify>,
     insert_connection_close: bool,
     id: log_utils::IdChain<u64>,
@@ -85,14 +85,20 @@ where
     IO: net_utils::PeerAddr,
 {
     pub fn new(
-        core_settings: Arc<Settings>,
+        core_settings: &Settings,
         transport_stream: IO,
         parent_id_chain: log_utils::IdChain<u64>,
-    ) -> Self {
+    ) -> io::Result<Self> {
+        let upload_buffer_size = core_settings
+            .listen_protocols
+            .http1
+            .as_ref()
+            .ok_or_else(|| io::Error::other("HTTP1 listening is not configured"))?
+            .upload_buffer_size;
         let (download_tx, download_rx) = mpsc::channel(1);
         let (upload_tx, upload_rx) = mpsc::channel(1);
 
-        Self {
+        Ok(Self {
             state: State::WaitingRequest(WaitingRequest {
                 buffer: BytesMut::with_capacity(MAX_RAW_HEADERS_SIZE),
             }),
@@ -102,15 +108,10 @@ where
             download_eof: Arc::new(Notify::new()),
             upload_rx: Some(upload_rx),
             upload_tx,
-            upload_buffer_size: core_settings
-                .listen_protocols
-                .http1
-                .as_ref()
-                .unwrap()
-                .upload_buffer_size,
+            upload_buffer_size,
             parent_id_chain,
             next_request_id: 0..,
-        }
+        })
     }
 
     fn on_request_headers_chunk(&mut self, buffer: BytesMut) -> io::Result<RequestStatus> {
@@ -118,7 +119,9 @@ where
             DecodeStatus::Partial(bytes) => {
                 match &mut self.state {
                     State::WaitingRequest(x) => x.buffer = bytes,
-                    _ => unreachable!(),
+                    State::RequestInProgress(_) => {
+                        return Err(io::Error::other("HTTP1 request already in progress"))
+                    }
                 }
                 Ok(RequestStatus::Partial)
             }
@@ -133,8 +136,7 @@ where
                             .body(())
                             .map_err(|e| {
                                 io::Error::other(format!(
-                                    "Failed to build \"Expectation Failed\" response: {}",
-                                    e
+                                    "Failed to build \"Expectation Failed\" response: {e}"
                                 ))
                             })?
                             .into_parts()
@@ -149,14 +151,18 @@ where
 
                 let id = self.parent_id_chain.extended(log_utils::IdItem::new(
                     log_utils::CONNECTION_ID_FMT,
-                    self.next_request_id.next().unwrap(),
+                    self.next_request_id
+                        .next()
+                        .ok_or_else(|| io::Error::other("HTTP1 request IDs exhausted"))?,
                 ));
                 let insert_connection_close = request.method == http::Method::CONNECT;
                 Ok(RequestStatus::Complete(Box::new(Stream {
                     source: StreamSource {
                         request,
                         client_address: self.transport_stream.peer_addr()?.ip(),
-                        upload_rx: self.upload_rx.take().unwrap(),
+                        upload_rx: self.upload_rx.take().ok_or_else(|| {
+                            io::Error::other("HTTP1 upload receiver already taken")
+                        })?,
                         id: id.clone(),
                     },
                     sink: StreamSink {
@@ -182,7 +188,14 @@ where
                 let mut buffer = self.state.take_buffer();
                 if buffer.is_empty() {
                     if matches!(self.state, State::RequestInProgress(_)) {
-                        let _ = self.upload_tx.reserve().await;
+                        if let Err(e) = self.upload_tx.reserve().await {
+                            log_id!(
+                                debug,
+                                self.parent_id_chain,
+                                "Upload channel closed while waiting for capacity: {}",
+                                e
+                            );
+                        }
                     }
                     self.transport_stream.read_buf(&mut buffer).await?;
                 } else if matches!(self.state, State::WaitingRequest(_)) {
@@ -205,7 +218,7 @@ where
                                 RequestStatus::Complete(stream) => return Ok(Some(stream)),
                                 RequestStatus::NeedRespond(response) => {
                                     log_id!(debug, self.parent_id_chain, "Tunnel rejected, responding with: {:?}", response);
-                                    let mut response = encode_response(response);
+                                    let mut response = encode_response(&response)?;
                                     self.transport_stream.write_all_buf(&mut response).await?;
                                     return Ok(None);
                                 }
@@ -214,7 +227,7 @@ where
                         State::RequestInProgress(x) => {
                             x.buffer = BytesMut::with_capacity(self.upload_buffer_size);
                             match self.upload_tx.send(bytes.freeze()).await {
-                                Ok(_) => (),
+                                Ok(()) => (),
                                 Err(_) => return Err(io::Error::from(ErrorKind::UnexpectedEof)),
                             }
                         }
@@ -237,7 +250,7 @@ where
                     },
                     Some(mut bytes) => self.transport_stream.write_all_buf(&mut bytes).await?,
                 },
-                _ = self.download_eof.notified() => {
+                () = self.download_eof.notified() => {
                     self.graceful_shutdown().await?;
                     return Ok(None);
                 }
@@ -250,7 +263,14 @@ where
             self.transport_stream.write_all_buf(&mut chunk).await?;
         }
         self.transport_stream.flush().await?;
-        let _ = self.upload_tx.reserve().await;
+        if let Err(e) = self.upload_tx.reserve().await {
+            log_id!(
+                debug,
+                self.parent_id_chain,
+                "Upload channel closed during shutdown: {}",
+                e
+            );
+        }
         self.transport_stream.shutdown().await
     }
 
@@ -312,8 +332,8 @@ impl http_codec::PendingRespond for StreamSink {
         self.download_tx
             .as_ref()
             .ok_or_else(|| io::Error::from(ErrorKind::UnexpectedEof))?
-            .try_send(encode_response(response))
-            .map_err(|e| io::Error::other(format!("Failed to put response in queue: {}", e)))
+            .try_send(encode_response(&response)?)
+            .map_err(|e| io::Error::other(format!("Failed to put response in queue: {e}")))
     }
 
     fn send_response(
@@ -337,8 +357,8 @@ impl http_codec::PendingRespond for StreamSink {
         self.download_tx
             .as_ref()
             .ok_or_else(|| io::Error::from(ErrorKind::UnexpectedEof))?
-            .try_send(encode_response(response))
-            .map_err(|e| io::Error::other(format!("Failed to put response in queue: {}", e)))?;
+            .try_send(encode_response(&response)?)
+            .map_err(|e| io::Error::other(format!("Failed to put response in queue: {e}")))?;
 
         if eof {
             self.eof()?;
@@ -351,8 +371,8 @@ impl http_codec::PendingRespond for StreamSink {
 impl State {
     fn take_buffer(&mut self) -> BytesMut {
         match self {
-            State::WaitingRequest(x) => std::mem::take(&mut x.buffer),
-            State::RequestInProgress(x) => std::mem::take(&mut x.buffer),
+            Self::WaitingRequest(x) => std::mem::take(&mut x.buffer),
+            Self::RequestInProgress(x) => std::mem::take(&mut x.buffer),
         }
     }
 }
@@ -364,10 +384,11 @@ impl pipe::Source for StreamSource {
     }
 
     async fn read(&mut self) -> io::Result<pipe::Data> {
-        match self.upload_rx.recv().await {
-            None => Ok(pipe::Data::Eof),
-            Some(bytes) => Ok(pipe::Data::Chunk(bytes)),
-        }
+        Ok(self
+            .upload_rx
+            .recv()
+            .await
+            .map_or(pipe::Data::Eof, pipe::Data::Chunk))
     }
 
     fn consume(&mut self, _size: usize) -> io::Result<()> {
@@ -399,7 +420,7 @@ impl Sink for StreamSink {
             .ok_or_else(|| io::Error::from(ErrorKind::UnexpectedEof))?
             .try_send(data)
         {
-            Ok(_) => Ok(Bytes::new()),
+            Ok(()) => Ok(Bytes::new()),
             Err(mpsc::error::TrySendError::Full(unsent)) => Ok(unsent),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 Err(io::Error::from(ErrorKind::UnexpectedEof))
@@ -434,7 +455,7 @@ impl http_codec::DroppingSink for StreamSink {
             .ok_or_else(|| io::Error::from(ErrorKind::UnexpectedEof))?
             .try_send(data)
         {
-            Ok(_) => Ok(datagram_pipe::SendStatus::Sent),
+            Ok(()) => Ok(datagram_pipe::SendStatus::Sent),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(datagram_pipe::SendStatus::Dropped),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 Err(io::Error::from(ErrorKind::UnexpectedEof))
@@ -443,70 +464,75 @@ impl http_codec::DroppingSink for StreamSink {
     }
 }
 
-fn version_minor_digit(v: http::Version) -> u32 {
+fn version_minor_digit(v: http::Version) -> io::Result<u8> {
     match v {
-        http::Version::HTTP_10 => 0,
-        http::Version::HTTP_11 => 1,
-        _ => unreachable!(),
+        http::Version::HTTP_10 => Ok(b'0'),
+        http::Version::HTTP_11 => Ok(b'1'),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "Not an HTTP/1 version",
+        )),
     }
 }
 
-fn httparse_to_http_version(v: u8) -> http::Version {
+fn httparse_to_http_version(v: u8) -> io::Result<http::Version> {
     match v {
-        0 => http::Version::HTTP_10,
-        1 => http::Version::HTTP_11,
-        _ => unreachable!(),
+        0 => Ok(http::Version::HTTP_10),
+        1 => Ok(http::Version::HTTP_11),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Not an HTTP/1 version",
+        )),
     }
 }
 
 fn encode_headers(mut buffer: BytesMut, headers: &http::HeaderMap<http::HeaderValue>) -> BytesMut {
     for (name, value) in headers {
         buffer.put(name.as_ref());
-        buffer.put(": ".as_bytes());
+        buffer.put(b": ".as_slice());
         buffer.put(value.as_bytes());
-        buffer.put("\r\n".as_bytes());
+        buffer.put(b"\r\n".as_slice());
     }
-    buffer.put("\r\n".as_bytes());
+    buffer.put(b"\r\n".as_slice());
 
     buffer
 }
 
-pub(crate) fn encode_request(request: &RequestHeaders) -> Bytes {
+pub fn encode_request(request: &RequestHeaders) -> io::Result<Bytes> {
     let mut encoded = BytesMut::new();
 
     encoded.put(request.method.as_str().as_bytes());
-    encoded.put([b' '].as_slice());
+    encoded.put(b" ".as_slice());
     encoded.put(
         request
             .uri
             .path_and_query()
-            .map(http::uri::PathAndQuery::as_str)
-            .unwrap_or("/")
+            .map_or("/", http::uri::PathAndQuery::as_str)
             .as_bytes(),
     );
-    encoded.put(" HTTP/1.".as_bytes());
-    encoded.put([('0' as u32 + version_minor_digit(request.version)) as u8].as_slice());
-    encoded.put("\r\n".as_bytes());
+    encoded.put(b" HTTP/1.".as_slice());
+    encoded.put([version_minor_digit(request.version)?].as_slice());
+    encoded.put(b"\r\n".as_slice());
 
     if let Some(host) = request.uri.authority() {
-        encoded.put("Host: ".as_bytes());
+        encoded.put(b"Host: ".as_slice());
         encoded.put(host.as_str().as_bytes());
-        encoded.put("\r\n".as_bytes());
+        encoded.put(b"\r\n".as_slice());
     }
 
     encoded = encode_headers(encoded, &request.headers);
 
-    encoded.freeze()
+    Ok(encoded.freeze())
 }
 
-pub(crate) fn encode_response(response: ResponseHeaders) -> Bytes {
+pub fn encode_response(response: &ResponseHeaders) -> io::Result<Bytes> {
     let mut encoded = BytesMut::new();
 
-    encoded.put("HTTP/1.".as_bytes());
-    encoded.put([('0' as u32 + version_minor_digit(response.version)) as u8].as_slice());
-    encoded.put([b' '].as_slice());
+    encoded.put(b"HTTP/1.".as_slice());
+    encoded.put([version_minor_digit(response.version)?].as_slice());
+    encoded.put(b" ".as_slice());
     encoded.put(response.status.as_str().as_bytes());
-    encoded.put([b' '].as_slice());
+    encoded.put(b" ".as_slice());
     encoded.put(
         response
             .status
@@ -514,14 +540,14 @@ pub(crate) fn encode_response(response: ResponseHeaders) -> Bytes {
             .unwrap_or_default()
             .as_bytes(),
     );
-    encoded.put("\r\n".as_bytes());
+    encoded.put(b"\r\n".as_slice());
 
     encoded = encode_headers(encoded, &response.headers);
 
-    encoded.freeze()
+    Ok(encoded.freeze())
 }
 
-pub(crate) fn decode_request(
+pub fn decode_request(
     mut buffer: BytesMut,
     headers_num_cap: usize,
     raw_buffer_cap: usize,
@@ -535,30 +561,19 @@ pub(crate) fn decode_request(
                     request
                         .version
                         .ok_or_else(|| io::Error::other("Version not found"))?,
-                ))
+                )?)
                 .method(
                     request
                         .method
                         .ok_or_else(|| io::Error::other("Method not found"))?,
                 );
 
-            let mut uri = match request.path {
-                None => {
-                    return Err(io::Error::other(format!(
-                        "Invalid path: {:?}",
-                        request.path
-                    )))
-                }
-                Some(p) => match http::uri::Uri::from_str(p) {
-                    Ok(uri) => uri,
-                    Err(e) => {
-                        return Err(io::Error::other(format!(
-                            "Invalid path: path={:?}, error={}",
-                            request.path, e
-                        )))
-                    }
-                },
-            };
+            let path = request
+                .path
+                .ok_or_else(|| io::Error::other(format!("Invalid path: {:?}", request.path)))?;
+            let mut uri = http::uri::Uri::from_str(path).map_err(|e| {
+                io::Error::other(format!("Invalid path: path={:?}, error={e}", request.path))
+            })?;
 
             for h in request.headers {
                 match h.name.to_lowercase().as_str() {
@@ -566,7 +581,7 @@ pub(crate) fn decode_request(
                         uri = http::uri::Uri::builder()
                             .scheme("https")
                             .authority(h.value)
-                            .path_and_query(request.path.unwrap())
+                            .path_and_query(path)
                             .build()
                             .map_err(|e| {
                                 io::Error::other(format!(
@@ -575,7 +590,7 @@ pub(crate) fn decode_request(
                                     utils::hex_dump(h.value),
                                     request.path,
                                 ))
-                            })?
+                            })?;
                     }
                     _ => request_builder = request_builder.header(h.name, h.value),
                 }
@@ -586,7 +601,7 @@ pub(crate) fn decode_request(
             Ok(DecodeStatus::Complete(
                 request_builder
                     .body(())
-                    .map_err(|e| io::Error::other(format!("Invalid request: {}", e)))?
+                    .map_err(|e| io::Error::other(format!("Invalid request: {e}")))?
                     .into_parts()
                     .0,
                 buffer.split_off(idx),
@@ -600,7 +615,7 @@ pub(crate) fn decode_request(
     }
 }
 
-pub(crate) fn decode_response(
+pub fn decode_response(
     mut buffer: BytesMut,
     headers_num_cap: usize,
     raw_buffer_cap: usize,
@@ -614,7 +629,7 @@ pub(crate) fn decode_response(
                     response
                         .version
                         .ok_or_else(|| io::Error::other("Version not found"))?,
-                ))
+                )?)
                 .status(
                     response
                         .code
@@ -622,13 +637,13 @@ pub(crate) fn decode_response(
                 );
 
             for h in response.headers {
-                response_builder = response_builder.header(h.name, h.value)
+                response_builder = response_builder.header(h.name, h.value);
             }
 
             Ok(DecodeStatus::Complete(
                 response_builder
                     .body(())
-                    .map_err(|e| io::Error::other(format!("Invalid response: {}", e)))?
+                    .map_err(|e| io::Error::other(format!("Invalid response: {e}")))?
                     .into_parts()
                     .0,
                 buffer.split_off(idx),
@@ -639,5 +654,168 @@ pub(crate) fn decode_response(
         }
         Ok(httparse::Status::Partial) => Err(io::Error::other("Too long HTTP response headers")),
         Err(e) => Err(io::Error::other(e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::check;
+
+    #[test]
+    fn request_wire_format_preserves_version_host_query_and_headers() -> io::Result<()> {
+        let request = http::Request::builder()
+            .version(http::Version::HTTP_10)
+            .method(http::Method::GET)
+            .uri("https://example.org:8443/a?b=c")
+            .header("x-test", "value")
+            .body(())
+            .map_err(io::Error::other)?
+            .into_parts()
+            .0;
+        check(
+            encode_request(&request)?
+                == b"GET /a?b=c HTTP/1.0\r\nHost: example.org:8443\r\nx-test: value\r\n\r\n"
+                    .as_slice(),
+            "Unexpected request bytes",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn response_wire_format_preserves_reason_and_headers() -> io::Result<()> {
+        let mut response = http::Response::<()>::default().into_parts().0;
+        response.status = http::StatusCode::BAD_GATEWAY;
+        response
+            .headers
+            .insert("connection", http::HeaderValue::from_static("close"));
+        check(
+            encode_response(&response)?
+                == b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n".as_slice(),
+            "Unexpected response bytes",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn encoding_rejects_other_http_versions() {
+        let mut request = http::Request::<()>::default().into_parts().0;
+        let mut response = http::Response::<()>::default().into_parts().0;
+        for version in [
+            http::Version::HTTP_09,
+            http::Version::HTTP_2,
+            http::Version::HTTP_3,
+        ] {
+            request.version = version;
+            response.version = version;
+            assert!(encode_request(&request).is_err());
+            assert!(encode_response(&response).is_err());
+        }
+    }
+
+    #[test]
+    fn fragmented_request_preserves_body_tail() -> io::Result<()> {
+        let prefix = BytesMut::from(
+            b"CONNECT example.org:443 HTTP/1.1\r\nHost: example.org:443\r\n".as_slice(),
+        );
+        let DecodeStatus::Partial(mut buffer) =
+            decode_request(prefix, MAX_HEADERS_NUM, MAX_RAW_HEADERS_SIZE)?
+        else {
+            return Err(io::Error::other("Expected partial request"));
+        };
+        buffer.extend_from_slice(b"\r\nbody");
+        let DecodeStatus::Complete(request, tail) =
+            decode_request(buffer, MAX_HEADERS_NUM, MAX_RAW_HEADERS_SIZE)?
+        else {
+            return Err(io::Error::other("Expected complete request"));
+        };
+        check(request.method == http::Method::CONNECT, "Unexpected method")?;
+        check(
+            request.uri.authority().map(http::uri::Authority::as_str) == Some("example.org:443"),
+            "Unexpected authority",
+        )?;
+        check(tail.as_ref() == b"body", "Unexpected body tail")?;
+        Ok(())
+    }
+
+    #[test]
+    fn partial_headers_at_limit_are_rejected() {
+        let buffer = BytesMut::from(b"GET / HTTP/1.1\r\nx: ".as_slice());
+        let limit = buffer.len();
+        assert!(decode_request(buffer, MAX_HEADERS_NUM, limit).is_err());
+    }
+
+    #[test]
+    fn fragmented_response_preserves_headers_and_body_tail() -> io::Result<()> {
+        let headers = b"HTTP/1.0 201 Created\r\nx-test: value\r\n\r\n";
+        for split in 0..headers.len() {
+            let DecodeStatus::Partial(mut buffer) = decode_response(
+                BytesMut::from(&headers[..split]),
+                MAX_HEADERS_NUM,
+                MAX_RAW_HEADERS_SIZE,
+            )?
+            else {
+                return Err(io::Error::other("Expected partial response"));
+            };
+            buffer.extend_from_slice(&headers[split..]);
+            buffer.extend_from_slice(b"body");
+            let DecodeStatus::Complete(response, tail) =
+                decode_response(buffer, MAX_HEADERS_NUM, MAX_RAW_HEADERS_SIZE)?
+            else {
+                return Err(io::Error::other("Expected complete response"));
+            };
+            check(
+                response.version == http::Version::HTTP_10,
+                "Unexpected HTTP version",
+            )?;
+            check(
+                response.status == http::StatusCode::CREATED,
+                "Unexpected status",
+            )?;
+            check(
+                response.headers.get("x-test") == Some(&http::HeaderValue::from_static("value")),
+                "Unexpected response header",
+            )?;
+            check(tail.as_ref() == b"body", "Unexpected body tail")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pending_request_auth_handles_absent_basic_and_invalid_headers() -> io::Result<()> {
+        use crate::http_codec::PendingRequest as _;
+
+        let mut source = StreamSource {
+            request: http::Request::<()>::default().into_parts().0,
+            client_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            upload_rx: mpsc::channel(1).1,
+            id: log_utils::IdChain::empty(),
+        };
+        check(source.auth_info()?.is_none(), "Unexpected authorization")?;
+        source.request.headers.insert(
+            http::header::PROXY_AUTHORIZATION,
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        check(
+            source.auth_info()?
+                == Some(crate::authentication::Source::ProxyBasic(
+                    "dXNlcjpwYXNz".into(),
+                )),
+            "Unexpected basic authorization",
+        )?;
+        for value in [
+            http::HeaderValue::from_static("Bearer token"),
+            http::HeaderValue::from_bytes(b"\xff").map_err(io::Error::other)?,
+        ] {
+            source
+                .request
+                .headers
+                .insert(http::header::PROXY_AUTHORIZATION, value);
+            check(
+                source.auth_info().is_err(),
+                "Expected invalid authorization",
+            )?;
+        }
+        Ok(())
     }
 }

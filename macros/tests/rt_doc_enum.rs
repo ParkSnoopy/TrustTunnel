@@ -1,10 +1,11 @@
+//! Regression tests for runtime documentation on enums.
+
 use macros::RuntimeDoc;
 
 #[test]
 fn slashed() {
     /// Trololo
-    #[allow(dead_code)]
-    #[derive(RuntimeDoc)]
+    #[derive(Debug, PartialEq, Eq, RuntimeDoc)]
     enum Foo {
         /// Haha
         Bar,
@@ -15,13 +16,13 @@ fn slashed() {
     assert_eq!(Foo::doc(), "Trololo");
     assert_eq!(Foo::doc_bar(), "Haha");
     assert_eq!(Foo::doc_baz(), "Hehe");
+    assert_ne!(Foo::Bar, Foo::Baz);
 }
 
 #[test]
 fn doc_attr() {
     #[doc = "Trololo"]
-    #[allow(dead_code)]
-    #[derive(RuntimeDoc)]
+    #[derive(Debug, PartialEq, Eq, RuntimeDoc)]
     enum Foo {
         #[doc = "Haha"]
         Bar,
@@ -32,14 +33,14 @@ fn doc_attr() {
     assert_eq!(Foo::doc(), "Trololo");
     assert_eq!(Foo::doc_bar(), "Haha");
     assert_eq!(Foo::doc_baz(), "Hehe");
+    assert_ne!(Foo::Bar, Foo::Baz);
 }
 
 #[test]
 fn mixed() {
     /// - How much watch?
     #[doc = "- Six watch"]
-    #[allow(dead_code)]
-    #[derive(RuntimeDoc)]
+    #[derive(Debug, PartialEq, Eq, RuntimeDoc)]
     enum Foo {
         /// - Such much?
         #[doc = "- For whom how"]
@@ -51,17 +52,18 @@ fn mixed() {
 
     assert_eq!(
         Foo::doc(),
-        r#"- How much watch?
-- Six watch"#
+        r"- How much watch?
+- Six watch"
     );
     assert_eq!(
         Foo::doc_bar(),
-        r#"- Such much?
-- For whom how"#
+        r"- Such much?
+- For whom how"
     );
     assert_eq!(
         Foo::doc_baz(),
-        r#"- MGIMO finished?
-- Ask"#
+        r"- MGIMO finished?
+- Ask"
     );
+    assert_ne!(Foo::Bar, Foo::Baz);
 }

@@ -1,29 +1,38 @@
+//! Ping routing over SNI and path across HTTP transports.
+
 use http::Request;
 use std::net::SocketAddr;
 use std::time::Duration;
 use trusttunnel::net_utils;
 
-#[allow(dead_code)]
 mod common;
+use common::TestResult;
+#[path = "common/endpoint.rs"]
+mod endpoint;
+#[path = "common/http_get.rs"]
+mod http_get;
+#[path = "common/quic.rs"]
+pub mod quic;
 
 macro_rules! ping_tests {
     ($($name:ident: $client_fn:expr,)*) => {
     $(
         #[tokio::test]
-        async fn $name() {
-            common::set_up_logger();
+        async fn $name() -> TestResult {
+            common::set_up_logger()?;
             let endpoint_address = common::make_endpoint_address();
 
             let client_task = async {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let status = $client_fn(&endpoint_address).await;
-                assert_eq!(status, http::StatusCode::OK);
+                let status = $client_fn(&endpoint_address).await?;
+                common::check(status == http::StatusCode::OK, "assertion failed: status == http::StatusCode::OK")?;
+                Ok::<(), common::TestError>(())
             };
 
             tokio::select! {
-                _ = common::run_endpoint(&endpoint_address) => unreachable!(),
-                _ = client_task => (),
-                _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("Timed out"),
+                result = endpoint::run_endpoint(&endpoint_address) => result,
+                result = client_task => result,
+                () = tokio::time::sleep(Duration::from_secs(10)) => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
             }
         }
     )*
@@ -39,15 +48,15 @@ ping_tests! {
     path_h3: path_h3_client,
 }
 
-async fn sni_h1_client(endpoint_address: &SocketAddr) -> http::StatusCode {
+async fn sni_h1_client(endpoint_address: &SocketAddr) -> TestResult<http::StatusCode> {
     let stream = common::establish_tls_connection(
         &format!("ping.{}", common::MAIN_DOMAIN_NAME),
         endpoint_address,
         None,
     )
-    .await;
+    .await?;
 
-    common::do_get_request(
+    Ok(http_get::do_get_request(
         stream,
         http::Version::HTTP_11,
         &format!(
@@ -57,20 +66,20 @@ async fn sni_h1_client(endpoint_address: &SocketAddr) -> http::StatusCode {
         ),
         &[],
     )
-    .await
+    .await?
     .0
-    .status
+    .status)
 }
 
-async fn sni_h2_client(endpoint_address: &SocketAddr) -> http::StatusCode {
+async fn sni_h2_client(endpoint_address: &SocketAddr) -> TestResult<http::StatusCode> {
     let stream = common::establish_tls_connection(
         &format!("ping.{}", common::MAIN_DOMAIN_NAME),
         endpoint_address,
         Some(net_utils::HTTP2_ALPN.as_bytes()),
     )
-    .await;
+    .await?;
 
-    common::do_get_request(
+    Ok(http_get::do_get_request(
         stream,
         http::Version::HTTP_2,
         &format!(
@@ -80,18 +89,18 @@ async fn sni_h2_client(endpoint_address: &SocketAddr) -> http::StatusCode {
         ),
         &[],
     )
-    .await
+    .await?
     .0
-    .status
+    .status)
 }
 
-async fn sni_h3_client(endpoint_address: &SocketAddr) -> http::StatusCode {
-    let mut conn = common::Http3Session::connect(
+async fn sni_h3_client(endpoint_address: &SocketAddr) -> TestResult<http::StatusCode> {
+    let mut conn = quic::Http3Session::connect(
         endpoint_address,
         &format!("ping.{}", common::MAIN_DOMAIN_NAME),
         None,
     )
-    .await;
+    .await?;
 
     conn.send_request(
         Request::get(format!(
@@ -99,19 +108,18 @@ async fn sni_h3_client(endpoint_address: &SocketAddr) -> http::StatusCode {
             common::MAIN_DOMAIN_NAME,
             endpoint_address.port()
         ))
-        .body(hyper::Body::empty())
-        .unwrap(),
+        .body(hyper::Body::empty())?,
     )
-    .await;
+    .await?;
 
-    conn.recv_response().await.status
+    Ok(conn.recv_response().await?.status)
 }
 
-async fn path_h1_client(endpoint_address: &SocketAddr) -> http::StatusCode {
+async fn path_h1_client(endpoint_address: &SocketAddr) -> TestResult<http::StatusCode> {
     let stream =
-        common::establish_tls_connection(common::MAIN_DOMAIN_NAME, endpoint_address, None).await;
+        common::establish_tls_connection(common::MAIN_DOMAIN_NAME, endpoint_address, None).await?;
 
-    common::do_get_request(
+    Ok(http_get::do_get_request(
         stream,
         http::Version::HTTP_11,
         &format!(
@@ -121,20 +129,20 @@ async fn path_h1_client(endpoint_address: &SocketAddr) -> http::StatusCode {
         ),
         &[],
     )
-    .await
+    .await?
     .0
-    .status
+    .status)
 }
 
-async fn path_h2_client(endpoint_address: &SocketAddr) -> http::StatusCode {
+async fn path_h2_client(endpoint_address: &SocketAddr) -> TestResult<http::StatusCode> {
     let stream = common::establish_tls_connection(
         common::MAIN_DOMAIN_NAME,
         endpoint_address,
         Some(net_utils::HTTP2_ALPN.as_bytes()),
     )
-    .await;
+    .await?;
 
-    common::do_get_request(
+    Ok(http_get::do_get_request(
         stream,
         http::Version::HTTP_2,
         &format!(
@@ -144,24 +152,23 @@ async fn path_h2_client(endpoint_address: &SocketAddr) -> http::StatusCode {
         ),
         &[],
     )
-    .await
+    .await?
     .0
-    .status
+    .status)
 }
 
-async fn path_h3_client(endpoint_address: &SocketAddr) -> http::StatusCode {
+async fn path_h3_client(endpoint_address: &SocketAddr) -> TestResult<http::StatusCode> {
     let mut conn =
-        common::Http3Session::connect(endpoint_address, common::MAIN_DOMAIN_NAME, None).await;
+        quic::Http3Session::connect(endpoint_address, common::MAIN_DOMAIN_NAME, None).await?;
     conn.send_request(
         Request::get(format!(
             "https://{}:{}/ping",
             common::MAIN_DOMAIN_NAME,
             endpoint_address.port()
         ))
-        .body(hyper::Body::empty())
-        .unwrap(),
+        .body(hyper::Body::empty())?,
     )
-    .await;
+    .await?;
 
-    conn.recv_response().await.status
+    Ok(conn.recv_response().await?.status)
 }

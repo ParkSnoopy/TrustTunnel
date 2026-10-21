@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - [Fix] Local builds no longer pin the Rust toolchain; Docker and CI use stable Rust.
+- [Fix] Library API: `client_config::build` now accepts `BuildOptions` and returns `io::Result<ClientConfig>` instead of panicking on export failures.
+- [Fix] Library API: `Core::new` and `Core::reload_tls_hosts_settings` now borrow `TlsHostsSettings`.
+- [Fix] Library API: `IcmpSettingsBuilder::interface_name` now accepts `Into<String>` values.
+- [Fix] Building `trusttunnel` without the `rt_doc` feature now supports client configuration export.
 
 ### Deprecated
 

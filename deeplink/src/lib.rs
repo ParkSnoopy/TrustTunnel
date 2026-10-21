@@ -1,15 +1,21 @@
-//! TrustTunnel Deep-Link Library
+//! `TrustTunnel` Deep-Link Library
 //!
-//! This library provides encoding and decoding functionality for TrustTunnel
+//! This library provides encoding and decoding functionality for `TrustTunnel`
 //! deep-link URIs (`tt://?` scheme). Deep-links allow compact, shareable
 //! configuration URIs that can be used across platforms (mobile, desktop, CLI).
 //!
 
+/// Certificate conversion between PEM and DER encodings.
 pub mod cert;
+/// Deep-link URI and binary payload decoding.
 pub mod decode;
+/// Deep-link URI and binary payload encoding.
 pub mod encode;
+/// Errors returned by deep-link operations.
 pub mod error;
+/// Configuration fields and wire-format identifiers.
 pub mod types;
+/// QUIC variable-length integer encoding and decoding.
 pub mod varint;
 
 pub use error::{DeepLinkError, Result};

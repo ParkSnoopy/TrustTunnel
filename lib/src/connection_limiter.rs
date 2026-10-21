@@ -13,14 +13,14 @@ struct ClientEntry {
 }
 
 /// Tracks active connections per client credentials and enforces per-client limits.
-pub(crate) struct ConnectionLimiter {
+pub struct ConnectionLimiter {
     clients: Mutex<HashMap<String, ClientEntry>>,
     default_max_http2: Option<u32>,
     default_max_http3: Option<u32>,
 }
 
 /// RAII guard that decrements the connection count when dropped.
-pub(crate) struct ConnectionGuard {
+pub struct ConnectionGuard {
     limiter: Arc<ConnectionLimiter>,
     creds: String,
     protocol: Protocol,
@@ -33,7 +33,7 @@ impl Drop for ConnectionGuard {
 }
 
 impl ConnectionLimiter {
-    /// Creates a new ConnectionLimiter.
+    /// Creates a new `ConnectionLimiter`.
     ///
     /// Note: The limiter captures the client list at initialization time and does not
     /// automatically update if clients are modified at runtime. A server restart is
@@ -76,7 +76,10 @@ impl ConnectionLimiter {
         creds: &str,
         protocol: Protocol,
     ) -> Option<ConnectionGuard> {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().unwrap_or_else(|error| {
+            log::error!("Recovering poisoned connection limiter: {error}");
+            error.into_inner()
+        });
 
         let entry = clients.get_mut(creds)?;
 
@@ -97,16 +100,20 @@ impl ConnectionLimiter {
             }
         }
 
-        *current += 1;
+        *current = current.checked_add(1)?;
+        drop(clients);
         Some(ConnectionGuard {
-            limiter: self.clone(),
+            limiter: Arc::clone(self),
             creds: creds.to_owned(),
             protocol,
         })
     }
 
     fn release(&self, creds: &str, protocol: Protocol) {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().unwrap_or_else(|error| {
+            log::error!("Recovering poisoned connection limiter: {error}");
+            error.into_inner()
+        });
         if let Some(entry) = clients.get_mut(creds) {
             match protocol {
                 Protocol::Http1 | Protocol::Http2 => {
@@ -149,21 +156,28 @@ mod tests {
     }
 
     fn creds(username: &str, password: &str) -> String {
-        BASE64_ENGINE.encode(format!("{}:{}", username, password))
+        BASE64_ENGINE.encode(format!("{username}:{password}"))
     }
 
     #[test]
-    fn no_limits_always_passes() {
+    fn no_limits_always_passes() -> Result<(), Box<dyn std::error::Error>> {
         let limiter = Arc::new(ConnectionLimiter::new(&[make_client("u", "p")], None, None));
         let key = creds("u", "p");
-        let g1 = limiter.try_acquire(&key, Protocol::Http2).unwrap();
-        let g2 = limiter.try_acquire(&key, Protocol::Http2).unwrap();
-        let g3 = limiter.try_acquire(&key, Protocol::Http3).unwrap();
+        let g1 = limiter
+            .try_acquire(&key, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let g2 = limiter
+            .try_acquire(&key, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let g3 = limiter
+            .try_acquire(&key, Protocol::Http3)
+            .ok_or("connection slot denied")?;
         drop((g1, g2, g3));
+        Ok(())
     }
 
     #[test]
-    fn global_http2_limit_enforced() {
+    fn global_http2_limit_enforced() -> Result<(), Box<dyn std::error::Error>> {
         let limiter = Arc::new(ConnectionLimiter::new(
             &[make_client("u", "p")],
             Some(2),
@@ -171,20 +185,26 @@ mod tests {
         ));
         let key = creds("u", "p");
 
-        let g1 = limiter.try_acquire(&key, Protocol::Http2).unwrap();
-        let g2 = limiter.try_acquire(&key, Protocol::Http2).unwrap();
-        assert!(
-            limiter.try_acquire(&key, Protocol::Http2).is_none(),
-            "must be denied at limit=2"
-        );
+        let g1 = limiter
+            .try_acquire(&key, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let g2 = limiter
+            .try_acquire(&key, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        if limiter.try_acquire(&key, Protocol::Http2).is_some() {
+            return Err("must be denied at limit=2".into());
+        }
 
         drop(g1);
-        let g3 = limiter.try_acquire(&key, Protocol::Http2).unwrap();
+        let g3 = limiter
+            .try_acquire(&key, Protocol::Http2)
+            .ok_or("connection slot denied")?;
         drop((g2, g3));
+        Ok(())
     }
 
     #[test]
-    fn global_http3_limit_enforced() {
+    fn global_http3_limit_enforced() -> Result<(), Box<dyn std::error::Error>> {
         let limiter = Arc::new(ConnectionLimiter::new(
             &[make_client("u", "p")],
             None,
@@ -192,18 +212,22 @@ mod tests {
         ));
         let key = creds("u", "p");
 
-        let g1 = limiter.try_acquire(&key, Protocol::Http3).unwrap();
-        assert!(
-            limiter.try_acquire(&key, Protocol::Http3).is_none(),
-            "must be denied at limit=1"
-        );
+        let g1 = limiter
+            .try_acquire(&key, Protocol::Http3)
+            .ok_or("connection slot denied")?;
+        if limiter.try_acquire(&key, Protocol::Http3).is_some() {
+            return Err("must be denied at limit=1".into());
+        }
 
         drop(g1);
-        limiter.try_acquire(&key, Protocol::Http3).unwrap();
+        limiter
+            .try_acquire(&key, Protocol::Http3)
+            .ok_or("connection slot denied")?;
+        Ok(())
     }
 
     #[test]
-    fn http2_and_http3_counters_are_independent() {
+    fn http2_and_http3_counters_are_independent() -> Result<(), Box<dyn std::error::Error>> {
         let limiter = Arc::new(ConnectionLimiter::new(
             &[make_client("u", "p")],
             Some(1),
@@ -211,20 +235,24 @@ mod tests {
         ));
         let key = creds("u", "p");
 
-        let _g2 = limiter.try_acquire(&key, Protocol::Http2).unwrap();
-        let _g3 = limiter.try_acquire(&key, Protocol::Http3).unwrap();
-        assert!(
-            limiter.try_acquire(&key, Protocol::Http2).is_none(),
-            "http2 must be at limit"
-        );
-        assert!(
-            limiter.try_acquire(&key, Protocol::Http3).is_none(),
-            "http3 must be at limit"
-        );
+        let _g2 = limiter
+            .try_acquire(&key, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let _g3 = limiter
+            .try_acquire(&key, Protocol::Http3)
+            .ok_or("connection slot denied")?;
+        if limiter.try_acquire(&key, Protocol::Http2).is_some() {
+            return Err("http2 must be at limit".into());
+        }
+        if limiter.try_acquire(&key, Protocol::Http3).is_some() {
+            return Err("http3 must be at limit".into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn per_client_override_takes_precedence_over_global() {
+    fn per_client_override_takes_precedence_over_global() -> Result<(), Box<dyn std::error::Error>>
+    {
         let clients = vec![
             make_client_with_limits("alice", "pass", Some(5), None),
             make_client("bob", "pass"),
@@ -234,41 +262,55 @@ mod tests {
         let alice = creds("alice", "pass");
         let bob = creds("bob", "pass");
 
-        let _a1 = limiter.try_acquire(&alice, Protocol::Http2).unwrap();
-        let _a2 = limiter.try_acquire(&alice, Protocol::Http2).unwrap();
-        let _a3 = limiter.try_acquire(&alice, Protocol::Http2).unwrap();
-        let _a4 = limiter.try_acquire(&alice, Protocol::Http2).unwrap();
-        let _a5 = limiter.try_acquire(&alice, Protocol::Http2).unwrap();
-        assert!(
-            limiter.try_acquire(&alice, Protocol::Http2).is_none(),
-            "alice: must be denied at override limit=5"
-        );
+        let _a1 = limiter
+            .try_acquire(&alice, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let _a2 = limiter
+            .try_acquire(&alice, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let _a3 = limiter
+            .try_acquire(&alice, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let _a4 = limiter
+            .try_acquire(&alice, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let _a5 = limiter
+            .try_acquire(&alice, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        if limiter.try_acquire(&alice, Protocol::Http2).is_some() {
+            return Err("alice: must be denied at override limit=5".into());
+        }
 
-        let _b1 = limiter.try_acquire(&bob, Protocol::Http2).unwrap();
-        assert!(
-            limiter.try_acquire(&bob, Protocol::Http2).is_none(),
-            "bob: must be denied at global limit=1"
-        );
+        let _b1 = limiter
+            .try_acquire(&bob, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        if limiter.try_acquire(&bob, Protocol::Http2).is_some() {
+            return Err("bob: must be denied at global limit=1".into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn limits_are_per_client_not_shared() {
+    fn limits_are_per_client_not_shared() -> Result<(), Box<dyn std::error::Error>> {
         let clients = vec![make_client("alice", "pass"), make_client("bob", "pass")];
         let limiter = Arc::new(ConnectionLimiter::new(&clients, Some(1), None));
 
         let alice = creds("alice", "pass");
         let bob = creds("bob", "pass");
 
-        let _ga = limiter.try_acquire(&alice, Protocol::Http2).unwrap();
-        let _gb = limiter.try_acquire(&bob, Protocol::Http2).unwrap();
-        assert!(
-            limiter.try_acquire(&alice, Protocol::Http2).is_none(),
-            "alice at limit"
-        );
-        assert!(
-            limiter.try_acquire(&bob, Protocol::Http2).is_none(),
-            "bob at limit"
-        );
+        let _ga = limiter
+            .try_acquire(&alice, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        let _gb = limiter
+            .try_acquire(&bob, Protocol::Http2)
+            .ok_or("connection slot denied")?;
+        if limiter.try_acquire(&alice, Protocol::Http2).is_some() {
+            return Err("alice at limit".into());
+        }
+        if limiter.try_acquire(&bob, Protocol::Http2).is_some() {
+            return Err("bob at limit".into());
+        }
+        Ok(())
     }
 
     #[test]
@@ -277,5 +319,30 @@ mod tests {
         assert!(limiter
             .try_acquire("unknown_creds", Protocol::Http2)
             .is_none());
+    }
+
+    #[test]
+    fn overflowing_slot_count_is_denied() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = Arc::new(ConnectionLimiter::new(&[make_client("u", "p")], None, None));
+        let key = creds("u", "p");
+        {
+            let mut clients = limiter.clients.lock().map_err(|error| error.to_string())?;
+            clients.get_mut(&key).ok_or("missing client")?.http2_count = u32::MAX;
+        }
+        if limiter.try_acquire(&key, Protocol::Http2).is_some() {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(limiter.try_acquire(&key, Protocol::Http2).is_none())
+            )
+            .into());
+        }
+        if limiter.try_acquire(&key, Protocol::Http3).is_none() {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(limiter.try_acquire(&key, Protocol::Http3).is_some())
+            )
+            .into());
+        }
+        Ok(())
     }
 }

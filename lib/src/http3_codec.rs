@@ -1,4 +1,5 @@
 use crate::http_codec::{HttpCodec, RequestHeaders, ResponseHeaders};
+use crate::net_utils::PeerAddr as _;
 use crate::quic_multiplexer::{QuicSocket, QuicSocketEvent};
 use crate::tls_demultiplexer::Protocol;
 use crate::{datagram_pipe, http_codec, log_id, log_utils, net_utils, pipe};
@@ -11,12 +12,12 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-pub(crate) struct Http3Codec {
+pub struct Http3Codec {
     socket: Arc<QuicSocket>,
     streams: HashMap<u64, Stream>,
-    /// Receives messages from [`StreamSource.codec_tx`] and [`StreamSink.codec_tx`]
+    /// Receives messages from [`StreamSource::codec_tx`] and [`StreamSink::codec_tx`]
     stream_rx: mpsc::UnboundedReceiver<StreamMessage>,
-    /// See [`StreamSource.codec_tx`] and [`StreamSink.codec_tx`]
+    /// See [`StreamSource::codec_tx`] and [`StreamSink::codec_tx`]
     codec_tx: Arc<mpsc::UnboundedSender<StreamMessage>>,
     parent_id_chain: log_utils::IdChain<u64>,
 }
@@ -28,9 +29,9 @@ enum StreamMessage {
 }
 
 struct Stream {
-    /// Sends messages to [`StreamSource.readable_event_rx`]
+    /// Sends messages to [`StreamSource::readable_event_rx`]
     readable_event_tx: mpsc::Sender<()>,
-    /// Sends messages to [`StreamSink.writable_event_rx`]
+    /// Sends messages to [`StreamSink::writable_event_rx`]
     writable_event_tx: mpsc::Sender<()>,
     read_shutdown: bool,
     write_shutdown: bool,
@@ -45,9 +46,9 @@ struct StreamSource {
     stream_id: u64,
     request: RequestHeaders,
     socket: Arc<QuicSocket>,
-    /// Receives messages from [`Stream.readable_event_tx`]
+    /// Receives messages from [`Stream::readable_event_tx`]
     readable_event_rx: mpsc::Receiver<()>,
-    /// Sends messages to [`Http3Codec.stream_rx`]
+    /// Sends messages to [`Http3Codec::stream_rx`]
     codec_tx: Arc<mpsc::UnboundedSender<StreamMessage>>,
     id: log_utils::IdChain<u64>,
 }
@@ -55,13 +56,13 @@ struct StreamSource {
 struct StreamSink {
     stream_id: u64,
     socket: Arc<QuicSocket>,
-    /// Receives messages from [`Stream.writable_event_tx`]
+    /// Receives messages from [`Stream::writable_event_tx`]
     writable_event_rx: mpsc::Receiver<()>,
-    /// Sends messages to [`Http3Codec.stream_rx`]
+    /// Sends messages to [`Http3Codec::stream_rx`]
     codec_tx: Arc<mpsc::UnboundedSender<StreamMessage>>,
     /// Equals to [`net_utils::MIN_USABLE_QUIC_STREAM_CAPACITY`] by default.
     /// In some cases may be assigned to different values
-    /// (see [`StreamSink::wait_writable()`]) to avoid busy loops.
+    /// (see [`StreamSink::wait_writable()`](pipe::Sink::wait_writable)) to avoid busy loops.
     data_frame_overhead: usize,
     id: log_utils::IdChain<u64>,
     /// Unsent response headers stored when `send_response()` encounters
@@ -90,7 +91,7 @@ impl Http3Codec {
                 Ok(())
             }
             StreamMessage::Shutdown(stream_id, direction) => {
-                self.on_stream_shutdown(stream_id, direction)
+                self.on_stream_shutdown(stream_id, direction.as_ref())
             }
         }
     }
@@ -98,7 +99,7 @@ impl Http3Codec {
     fn on_stream_shutdown(
         &mut self,
         stream_id: u64,
-        direction: Option<quiche::Shutdown>,
+        direction: Option<&quiche::Shutdown>,
     ) -> io::Result<()> {
         let stream = self
             .streams
@@ -135,10 +136,10 @@ impl Http3Codec {
     ) -> io::Result<Option<Box<dyn http_codec::Stream>>> {
         match event {
             QuicSocketEvent::Request(stream_id, request) => {
-                self.on_request(stream_id, *request).map(Some)
+                Ok(Some(self.on_request(stream_id, *request)))
             }
             QuicSocketEvent::Readable(stream_id) => {
-                self.on_stream_readable(stream_id).map(|_| None)
+                self.on_stream_readable(stream_id).map(|()| None)
             }
             QuicSocketEvent::Writable(streams) => {
                 self.notify_writable_streams(streams);
@@ -146,7 +147,14 @@ impl Http3Codec {
             }
             QuicSocketEvent::Close(stream_id) => {
                 // Client finished sending request body; keep write side open for response.
-                let _ = self.on_stream_shutdown(stream_id, Some(quiche::Shutdown::Read));
+                if let Err(e) = self.on_stream_shutdown(stream_id, Some(&quiche::Shutdown::Read)) {
+                    log_id!(
+                        debug,
+                        self.parent_id_chain,
+                        "Failed to close stream read side: {}",
+                        e
+                    );
+                }
                 Ok(None)
             }
         }
@@ -156,7 +164,7 @@ impl Http3Codec {
         &mut self,
         stream_id: u64,
         request: RequestHeaders,
-    ) -> io::Result<Box<dyn http_codec::Stream>> {
+    ) -> Box<dyn http_codec::Stream> {
         let (readable_tx, readable_rx) = mpsc::channel(1);
         let (writable_tx, writable_rx) = mpsc::channel(1);
 
@@ -175,7 +183,7 @@ impl Http3Codec {
             },
         );
 
-        Ok(Box::new(DetachedStream {
+        Box::new(DetachedStream {
             source: StreamSource {
                 stream_id,
                 request,
@@ -193,7 +201,7 @@ impl Http3Codec {
                 id,
                 pending_response: None,
             },
-        }))
+        })
     }
 
     fn on_stream_readable(&mut self, stream_id: u64) -> io::Result<()> {
@@ -205,10 +213,9 @@ impl Http3Codec {
         match stream.readable_event_tx.try_send(()) {
             // `Full` is not considered as an error in this case, as the stream does not need
             // multiple `readable` messages in the queue
-            Ok(_) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
             Err(e) => Err(io::Error::other(format!(
-                "Failed to send stream readable event: {}",
-                e
+                "Failed to send stream readable event: {e}"
             ))),
         }
     }
@@ -230,7 +237,7 @@ impl Http3Codec {
                     match stream.writable_event_tx.try_send(()) {
                         // `Full` is not considered as an error in this case, as the stream does not need
                         // multiple `writable` messages in the queue
-                        Ok(_) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
                         Err(e) => Err(io::Error::other(e)),
                     }
                 }
@@ -293,7 +300,14 @@ impl HttpCodec for Http3Codec {
                             stream_id,
                             e
                         );
-                        let _ = self.on_stream_shutdown(stream_id, None);
+                        if let Err(e) = self.on_stream_shutdown(stream_id, None) {
+                            log_id!(
+                                debug,
+                                self.parent_id_chain,
+                                "Failed to shut down stream: {}",
+                                e
+                            );
+                        }
                     }
                 }
                 Some(FiredEvent::Socket(event)) => match self.on_socket_event(event)? {
@@ -314,10 +328,9 @@ impl HttpCodec for Http3Codec {
 }
 
 impl StreamMessage {
-    fn stream_id(&self) -> u64 {
+    const fn stream_id(&self) -> u64 {
         match self {
-            StreamMessage::WaitingWritable(stream_id) => *stream_id,
-            StreamMessage::Shutdown(stream_id, _) => *stream_id,
+            Self::WaitingWritable(stream_id) | Self::Shutdown(stream_id, _) => *stream_id,
         }
     }
 }
@@ -367,18 +380,14 @@ impl pipe::Source for StreamSource {
 
     async fn read(&mut self) -> io::Result<pipe::Data> {
         loop {
-            match self.socket.read(self.stream_id)? {
-                Some(chunk) => return Ok(pipe::Data::Chunk(chunk)),
-                None => {
-                    if self.socket.stream_finished(self.stream_id) {
-                        return Ok(pipe::Data::Eof);
-                    } else {
-                        match self.readable_event_rx.recv().await {
-                            None => return Err(io::Error::from(ErrorKind::UnexpectedEof)),
-                            Some(_) => continue,
-                        }
-                    }
-                }
+            if let Some(chunk) = self.socket.read(self.stream_id)? {
+                return Ok(pipe::Data::Chunk(chunk));
+            }
+            if self.socket.stream_finished(self.stream_id) {
+                return Ok(pipe::Data::Eof);
+            }
+            if self.readable_event_rx.recv().await.is_none() {
+                return Err(io::Error::from(ErrorKind::UnexpectedEof));
             }
         }
     }
@@ -395,7 +404,7 @@ impl Drop for StreamSource {
             self.stream_id,
             Some(quiche::Shutdown::Read),
         )) {
-            Ok(_) => (),
+            Ok(()) => (),
             Err(e) => log_id!(debug, self.id, "Failed to notify of read shutdown: {}", e),
         }
     }
@@ -411,7 +420,7 @@ impl StreamSink {
                         self.codec_tx
                             .send(StreamMessage::Shutdown(self.stream_id, None))
                             .map_err(|e| {
-                                io::Error::other(format!("Failed to send shutdown message: {}", e))
+                                io::Error::other(format!("Failed to send shutdown message: {e}"))
                             })?;
                     }
                 }
@@ -436,9 +445,8 @@ impl StreamSink {
                     self.codec_tx
                         .send(StreamMessage::WaitingWritable(self.stream_id))
                         .map_err(|_| io::Error::from(ErrorKind::UnexpectedEof))?;
-                    match self.writable_event_rx.recv().await {
-                        None => return Err(io::Error::from(ErrorKind::UnexpectedEof)),
-                        Some(_) => continue,
+                    if self.writable_event_rx.recv().await.is_none() {
+                        return Err(io::Error::from(ErrorKind::UnexpectedEof));
                     }
                 }
                 Err(e) => return Err(io::Error::other(e.to_string())),
@@ -532,7 +540,7 @@ impl pipe::Sink for StreamSink {
                 .map_err(|_| io::Error::from(ErrorKind::UnexpectedEof))?;
             match self.writable_event_rx.recv().await {
                 None => return Err(io::Error::from(ErrorKind::UnexpectedEof)),
-                Some(_) => self.try_send_pending_response()?,
+                Some(()) => self.try_send_pending_response()?,
             }
         }
         Ok(())
@@ -562,8 +570,25 @@ impl Drop for StreamSink {
             self.stream_id,
             Some(quiche::Shutdown::Write),
         )) {
-            Ok(_) => (),
+            Ok(()) => (),
             Err(e) => log_id!(debug, self.id, "Failed to notify of write shutdown: {}", e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_messages_preserve_ids_for_all_shutdown_directions() {
+        assert_eq!(StreamMessage::WaitingWritable(42).stream_id(), 42);
+        for direction in [
+            Some(quiche::Shutdown::Read),
+            Some(quiche::Shutdown::Write),
+            None,
+        ] {
+            assert_eq!(StreamMessage::Shutdown(42, direction).stream_id(), 42);
         }
     }
 }

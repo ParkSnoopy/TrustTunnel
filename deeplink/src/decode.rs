@@ -52,6 +52,32 @@ fn decode_protocol(data: &[u8]) -> Result<Protocol> {
     Protocol::from_u8(data[0])
 }
 
+fn decode_client_random_prefix(value: &[u8]) -> Result<String> {
+    let prefix = decode_string(value)?;
+    // Validate hex format
+    let (prefix_part, mask_part) = prefix.split_once('/').unwrap_or((&prefix, ""));
+    hex::decode(prefix_part).map_err(|e| {
+        DeepLinkError::InvalidAddress(format!("client_random_prefix must be valid hex: {e}"))
+    })?;
+    hex::decode(mask_part).map_err(|e| {
+        DeepLinkError::InvalidAddress(format!("client_random_prefix mask must be valid hex: {e}"))
+    })?;
+    Ok(prefix)
+}
+
+type TlvField = (Option<TlvTag>, Vec<u8>);
+
+fn decode_version(value: &[u8]) -> Result<()> {
+    let (v, _) = decode_varint(value, 0)?;
+    if v > CURRENT_VERSION {
+        return Err(DeepLinkError::UnsupportedVersion {
+            found: v,
+            max_supported: CURRENT_VERSION,
+        });
+    }
+    Ok(())
+}
+
 /// TLV parser with stateful offset tracking.
 struct TlvParser<'a> {
     data: &'a [u8],
@@ -59,13 +85,13 @@ struct TlvParser<'a> {
 }
 
 impl<'a> TlvParser<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        TlvParser { data, offset: 0 }
+    const fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
     }
 
-    /// Parse the next TLV field, returning (tag, value_bytes).
+    /// Parse the next TLV field, returning (tag, `value_bytes`).
     /// Returns None when end of data is reached.
-    fn next_field(&mut self) -> Option<Result<(Option<TlvTag>, Vec<u8>)>> {
+    fn next_field(&mut self) -> Option<Result<TlvField>> {
         if self.offset >= self.data.len() {
             return None;
         }
@@ -105,7 +131,12 @@ impl<'a> TlvParser<'a> {
     }
 }
 
-/// Decode a TLV binary payload into a DeepLinkConfig.
+/// Decode a TLV binary payload into a `DeepLinkConfig`.
+///
+/// # Errors
+///
+/// Returns [`DeepLinkError`] for malformed fields, unsupported versions,
+/// invalid hexadecimal data, or configuration validation failures.
 pub fn decode_tlv_payload(payload: &[u8]) -> Result<DeepLinkConfig> {
     let mut parser = TlvParser::new(payload);
 
@@ -129,21 +160,10 @@ pub fn decode_tlv_payload(payload: &[u8]) -> Result<DeepLinkConfig> {
         let (tag_opt, value) = field_result?;
 
         // Unknown tags are ignored per spec (forward compatibility)
-        let tag = match tag_opt {
-            Some(t) => t,
-            None => continue,
-        };
+        let Some(tag) = tag_opt else { continue };
 
         match tag {
-            TlvTag::Version => {
-                let (v, _) = decode_varint(&value, 0)?;
-                if v > CURRENT_VERSION {
-                    return Err(DeepLinkError::UnsupportedVersion {
-                        found: v,
-                        max_supported: CURRENT_VERSION,
-                    });
-                }
-            }
+            TlvTag::Version => decode_version(&value)?,
             TlvTag::Hostname => {
                 hostname = Some(decode_string(&value)?);
             }
@@ -175,29 +195,13 @@ pub fn decode_tlv_payload(payload: &[u8]) -> Result<DeepLinkConfig> {
                 anti_dpi = decode_bool(&value)?;
             }
             TlvTag::ClientRandomPrefix => {
-                let prefix = decode_string(&value)?;
-                // Validate hex format
-                let (prefix_part, mask_part) = prefix.split_once('/').unwrap_or((&prefix, ""));
-                hex::decode(prefix_part).map_err(|e| {
-                    DeepLinkError::InvalidAddress(format!(
-                        "client_random_prefix must be valid hex: {}",
-                        e
-                    ))
-                })?;
-                hex::decode(mask_part).map_err(|e| {
-                    DeepLinkError::InvalidAddress(format!(
-                        "client_random_prefix mask must be valid hex: {}",
-                        e
-                    ))
-                })?;
-                client_random_prefix = Some(prefix);
+                client_random_prefix = Some(decode_client_random_prefix(&value)?);
             }
             TlvTag::ClientRandomAuthKey => {
                 let auth_key = decode_string(&value)?;
                 hex::decode(&auth_key).map_err(|e| {
                     DeepLinkError::InvalidAddress(format!(
-                        "client_random_auth_key must be valid hex: {}",
-                        e
+                        "client_random_auth_key must be valid hex: {e}"
                     ))
                 })?;
                 client_random_auth_key = Some(auth_key);
@@ -254,7 +258,7 @@ pub fn decode(uri: &str) -> Result<DeepLinkConfig> {
     let encoded = uri
         .strip_prefix("tt://?")
         .or_else(|| uri.strip_prefix("tt://"))
-        .ok_or(DeepLinkError::InvalidScheme(uri.to_string()))?;
+        .ok_or_else(|| DeepLinkError::InvalidScheme(uri.to_string()))?;
 
     // Decode base64url
     let payload = URL_SAFE_NO_PAD
@@ -268,82 +272,100 @@ pub fn decode(uri: &str) -> Result<DeepLinkConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::{prop_assert, prop_assert_eq};
+
+    type TestResult = proptest::test_runner::TestCaseResult;
 
     #[test]
-    fn test_decode_string() {
-        assert_eq!(decode_string(b"hello").unwrap(), "hello");
-        assert!(decode_string(&[0xFF, 0xFE]).is_err()); // Invalid UTF-8
+    fn test_decode_string() -> TestResult {
+        prop_assert_eq!(decode_string(b"hello")?, "hello");
+        prop_assert!(decode_string(&[0xFF, 0xFE]).is_err()); // Invalid UTF-8
+        Ok(())
     }
 
     #[test]
-    fn test_decode_bool() {
-        assert!(!decode_bool(&[0x00]).unwrap());
-        assert!(decode_bool(&[0x01]).unwrap());
-        assert!(decode_bool(&[0x02]).is_err());
-        assert!(decode_bool(&[0x00, 0x01]).is_err()); // Wrong length
+    fn test_decode_bool() -> TestResult {
+        prop_assert!(!decode_bool(&[0x00])?);
+        prop_assert!(decode_bool(&[0x01])?);
+        prop_assert!(decode_bool(&[0x02]).is_err());
+        prop_assert!(decode_bool(&[0x00, 0x01]).is_err()); // Wrong length
+        Ok(())
     }
 
     #[test]
-    fn test_decode_protocol() {
-        assert_eq!(decode_protocol(&[0x01]).unwrap(), Protocol::Http2);
-        assert_eq!(decode_protocol(&[0x02]).unwrap(), Protocol::Http3);
-        assert!(decode_protocol(&[0x03]).is_err());
+    fn test_decode_protocol() -> TestResult {
+        prop_assert_eq!(decode_protocol(&[0x01])?, Protocol::Http2);
+        prop_assert_eq!(decode_protocol(&[0x02])?, Protocol::Http3);
+        prop_assert!(decode_protocol(&[0x03]).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_decode_address_ip() {
-        let addr = decode_string(b"1.2.3.4:443").unwrap();
-        assert_eq!(addr, "1.2.3.4:443");
+    fn test_decode_address_ip() -> TestResult {
+        let addr = decode_string(b"1.2.3.4:443")?;
+        prop_assert_eq!(addr, "1.2.3.4:443");
+        Ok(())
     }
 
     #[test]
-    fn test_decode_address_domain() {
-        let addr = decode_string(b"vpn.example.com:443").unwrap();
-        assert_eq!(addr, "vpn.example.com:443");
+    fn test_decode_address_domain() -> TestResult {
+        let addr = decode_string(b"vpn.example.com:443")?;
+        prop_assert_eq!(addr, "vpn.example.com:443");
+        Ok(())
     }
 
     #[test]
-    fn test_tlv_parser() {
+    fn test_tlv_parser() -> TestResult {
         // Create a simple TLV: tag=0x01, length=5, value="hello"
         let data = vec![0x01, 0x05, b'h', b'e', b'l', b'l', b'o'];
         let mut parser = TlvParser::new(&data);
 
-        let (tag, value) = parser.next_field().unwrap().unwrap();
-        assert_eq!(tag, Some(TlvTag::Hostname));
-        assert_eq!(value, b"hello");
+        let (tag, value) = parser
+            .next_field()
+            .ok_or_else(|| proptest::test_runner::TestCaseError::fail("expected a TLV field"))??;
+        prop_assert_eq!(tag, Some(TlvTag::Hostname));
+        prop_assert_eq!(value, b"hello");
 
-        assert!(parser.next_field().is_none());
+        prop_assert!(parser.next_field().is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_tlv_parser_unknown_tag() {
+    fn test_tlv_parser_unknown_tag() -> TestResult {
         // Unknown tag 0x10 should be parsed but returned as None
         let data = vec![0x10, 0x03, 0x01, 0x02, 0x03];
         let mut parser = TlvParser::new(&data);
 
-        let (tag, value) = parser.next_field().unwrap().unwrap();
-        assert_eq!(tag, None); // Unknown tag
-        assert_eq!(value, vec![0x01, 0x02, 0x03]);
+        let (tag, value) = parser
+            .next_field()
+            .ok_or_else(|| proptest::test_runner::TestCaseError::fail("expected a TLV field"))??;
+        prop_assert_eq!(tag, None); // Unknown tag
+        prop_assert_eq!(value, vec![0x01, 0x02, 0x03]);
+        Ok(())
     }
 
     #[test]
-    fn test_tlv_parser_truncated() {
+    fn test_tlv_parser_truncated() -> TestResult {
         // Tag=0x01, length=10, but only 3 bytes of value
         let data = vec![0x01, 0x0A, 0x01, 0x02, 0x03];
         let mut parser = TlvParser::new(&data);
 
-        let result = parser.next_field().unwrap();
-        assert!(result.is_err());
+        let result = parser
+            .next_field()
+            .ok_or_else(|| proptest::test_runner::TestCaseError::fail("expected a TLV field"))?;
+        prop_assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_decode_invalid_scheme() {
+    fn test_decode_invalid_scheme() -> TestResult {
         let result = decode("http://example.com");
-        assert!(result.is_err());
+        prop_assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_decode_legacy_format_without_question_mark() {
+    fn test_decode_legacy_format_without_question_mark() -> TestResult {
         // Old format tt://Base64 should still be parsed successfully
         use crate::encode::encode_tlv_payload;
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -353,166 +375,213 @@ mod tests {
             .addresses(vec!["1.2.3.4:443".to_string()])
             .username("alice".to_string())
             .password("secret".to_string())
-            .build()
-            .unwrap();
+            .build()?;
 
-        let payload = encode_tlv_payload(&config).unwrap();
+        let payload = encode_tlv_payload(&config)?;
         let encoded = URL_SAFE_NO_PAD.encode(&payload);
 
         // Legacy format without ?
-        let legacy_uri = format!("tt://{}", encoded);
-        let decoded = decode(&legacy_uri).unwrap();
-        assert_eq!(decoded.hostname.as_deref(), Some("vpn.example.com"));
-        assert_eq!(decoded.username.as_deref(), Some("alice"));
+        let legacy_uri = format!("tt://{encoded}");
+        let decoded = decode(&legacy_uri)?;
+        prop_assert_eq!(decoded.hostname.as_deref(), Some("vpn.example.com"));
+        prop_assert_eq!(decoded.username.as_deref(), Some("alice"));
 
         // New format with ?
-        let new_uri = format!("tt://?{}", encoded);
-        let decoded2 = decode(&new_uri).unwrap();
-        assert_eq!(decoded2.hostname.as_deref(), Some("vpn.example.com"));
-        assert_eq!(decoded2.username.as_deref(), Some("alice"));
+        let new_uri = format!("tt://?{encoded}");
+        let decoded2 = decode(&new_uri)?;
+        prop_assert_eq!(decoded2.hostname.as_deref(), Some("vpn.example.com"));
+        prop_assert_eq!(decoded2.username.as_deref(), Some("alice"));
+        Ok(())
     }
 
     #[test]
-    fn test_decode_client_random_with_mask() {
+    fn test_decode_client_random_with_mask() -> TestResult {
         let data = vec![
             0x0B, 0x09, b'5', b'8', b'4', b'1', b'/', b'7', b'a', b'4', b'3',
         ];
         let mut parser = TlvParser::new(&data);
 
-        let (tag, value) = parser.next_field().unwrap().unwrap();
-        assert_eq!(tag, Some(TlvTag::ClientRandomPrefix));
-        assert_eq!(value, b"5841/7a43");
-    }
-
-    fn tlv_bytes(tag: u8, value: &[u8]) -> Vec<u8> {
-        use crate::varint::encode_varint;
-        let mut out = encode_varint(tag as u64).unwrap();
-        out.extend(encode_varint(value.len() as u64).unwrap());
-        out.extend_from_slice(value);
-        out
+        let (tag, value) = parser
+            .next_field()
+            .ok_or_else(|| proptest::test_runner::TestCaseError::fail("expected a TLV field"))??;
+        prop_assert_eq!(tag, Some(TlvTag::ClientRandomPrefix));
+        prop_assert_eq!(value, b"5841/7a43");
+        Ok(())
     }
 
     #[test]
-    fn test_decode_subscription_only_v2() {
+    fn test_decode_client_random_prefix_validation() -> TestResult {
+        for prefix in ["", "5841", "5841/", "/7a43", "5841/7a43"] {
+            prop_assert_eq!(decode_client_random_prefix(prefix.as_bytes())?, prefix);
+        }
+        for (prefix, field) in [
+            ("gg/gg", "client_random_prefix"),
+            ("a", "client_random_prefix"),
+            ("5841/g", "client_random_prefix mask"),
+            ("5841/7a/43", "client_random_prefix mask"),
+        ] {
+            let error = decode_client_random_prefix(prefix.as_bytes())
+                .err()
+                .ok_or_else(|| {
+                    proptest::test_runner::TestCaseError::fail("invalid prefix was accepted")
+                })?;
+            let DeepLinkError::InvalidAddress(message) = error else {
+                return Err(proptest::test_runner::TestCaseError::fail(
+                    "unexpected prefix validation error",
+                ));
+            };
+            prop_assert!(
+                message.starts_with(&format!("{field} must be valid hex: ")),
+                "validation assertion failed"
+            );
+        }
+        prop_assert!(matches!(
+            decode_client_random_prefix(&[0xFF]),
+            Err(DeepLinkError::InvalidUtf8(_))
+        ));
+        Ok(())
+    }
+
+    fn tlv_bytes(tag: u8, value: &[u8]) -> Result<Vec<u8>> {
+        use crate::varint::encode_varint;
+        let mut out = encode_varint(u64::from(tag))?;
+        out.extend(encode_varint(value.len() as u64)?);
+        out.extend_from_slice(value);
+        Ok(out)
+    }
+
+    #[test]
+    fn test_decode_subscription_only_v2() -> TestResult {
         use crate::varint::encode_varint;
 
         let url = "https://alice:s3cret@vpn.example.com/subscription";
-        let mut payload = tlv_bytes(0x00, &encode_varint(2).unwrap());
-        payload.extend(tlv_bytes(0x0E, url.as_bytes()));
+        let mut payload = tlv_bytes(0x00, &encode_varint(2)?)?;
+        payload.extend(tlv_bytes(0x0E, url.as_bytes())?);
 
-        let config = decode_tlv_payload(&payload).unwrap();
-        assert_eq!(config.subscription_url.as_deref(), Some(url));
-        assert_eq!(config.hostname, None);
-        assert!(config.addresses.is_empty());
-        assert_eq!(config.username, None);
-        assert_eq!(config.password, None);
+        let config = decode_tlv_payload(&payload)?;
+        prop_assert_eq!(config.subscription_url.as_deref(), Some(url));
+        prop_assert_eq!(config.hostname, None);
+        prop_assert_eq!(config.addresses, Vec::<String>::new());
+        prop_assert_eq!(config.username, None);
+        prop_assert_eq!(config.password, None);
+        Ok(())
     }
 
     #[test]
-    fn test_decode_rejects_non_https_subscription_url() {
+    fn test_decode_rejects_non_https_subscription_url() -> TestResult {
         use crate::varint::encode_varint;
 
-        let mut payload = tlv_bytes(0x00, &encode_varint(2).unwrap());
-        payload.extend(tlv_bytes(0x0E, b"http://vpn.example.com/subscription"));
+        let mut payload = tlv_bytes(0x00, &encode_varint(2)?)?;
+        payload.extend(tlv_bytes(0x0E, b"http://vpn.example.com/subscription")?);
 
         let result = decode_tlv_payload(&payload);
-        assert!(matches!(
-            result.unwrap_err(),
-            DeepLinkError::InvalidSubscriptionUrl(_)
+        prop_assert!(matches!(
+            result,
+            Err(DeepLinkError::InvalidSubscriptionUrl(_))
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_decode_v1_link_with_required_fields_accepted() {
+    fn test_decode_v1_link_with_required_fields_accepted() -> TestResult {
         use crate::varint::encode_varint;
 
-        let mut payload = tlv_bytes(0x00, &encode_varint(1).unwrap());
-        payload.extend(tlv_bytes(0x01, b"vpn.example.com"));
-        payload.extend(tlv_bytes(0x02, b"1.2.3.4:443"));
-        payload.extend(tlv_bytes(0x05, b"alice"));
-        payload.extend(tlv_bytes(0x06, b"s3cret"));
+        let mut payload = tlv_bytes(0x00, &encode_varint(1)?)?;
+        payload.extend(tlv_bytes(0x01, b"vpn.example.com")?);
+        payload.extend(tlv_bytes(0x02, b"1.2.3.4:443")?);
+        payload.extend(tlv_bytes(0x05, b"alice")?);
+        payload.extend(tlv_bytes(0x06, b"s3cret")?);
 
-        let config = decode_tlv_payload(&payload).unwrap();
-        assert_eq!(config.hostname.as_deref(), Some("vpn.example.com"));
-        assert_eq!(config.subscription_url, None);
+        let config = decode_tlv_payload(&payload)?;
+        prop_assert_eq!(config.hostname.as_deref(), Some("vpn.example.com"));
+        prop_assert_eq!(config.subscription_url, None);
+        Ok(())
     }
 
     #[test]
-    fn test_decode_v1_link_missing_required_field_rejected() {
+    fn test_decode_v1_link_missing_required_field_rejected() -> TestResult {
         use crate::varint::encode_varint;
 
         // No password tag and no subscription_url: still a hard error.
-        let mut payload = tlv_bytes(0x00, &encode_varint(1).unwrap());
-        payload.extend(tlv_bytes(0x01, b"vpn.example.com"));
-        payload.extend(tlv_bytes(0x02, b"1.2.3.4:443"));
-        payload.extend(tlv_bytes(0x05, b"alice"));
+        let mut payload = tlv_bytes(0x00, &encode_varint(1)?)?;
+        payload.extend(tlv_bytes(0x01, b"vpn.example.com")?);
+        payload.extend(tlv_bytes(0x02, b"1.2.3.4:443")?);
+        payload.extend(tlv_bytes(0x05, b"alice")?);
 
         let result = decode_tlv_payload(&payload);
-        assert!(matches!(
-            result.unwrap_err(),
-            DeepLinkError::MissingRequiredField("password")
+        prop_assert!(matches!(
+            result,
+            Err(DeepLinkError::MissingRequiredField("password"))
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_decode_rejects_version_3() {
+    fn test_decode_rejects_version_3() -> TestResult {
         use crate::varint::encode_varint;
 
-        let mut payload = tlv_bytes(0x00, &encode_varint(3).unwrap());
-        payload.extend(tlv_bytes(0x0E, b"https://vpn.example.com/subscription"));
+        let mut payload = tlv_bytes(0x00, &encode_varint(3)?)?;
+        payload.extend(tlv_bytes(0x0E, b"https://vpn.example.com/subscription")?);
 
         let result = decode_tlv_payload(&payload);
-        assert!(matches!(
-            result.unwrap_err(),
-            DeepLinkError::UnsupportedVersion {
-                found: 3,
-                max_supported: 2
-            }
-        ));
+        prop_assert!(
+            matches!(
+                result,
+                Err(DeepLinkError::UnsupportedVersion {
+                    found: 3,
+                    max_supported: 2
+                })
+            ),
+            "validation assertion failed"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_roundtrip() {
+    fn test_auth_key_roundtrip() -> TestResult {
         let config = DeepLinkConfig::builder()
             .hostname("vpn.example.com".to_string())
             .addresses(vec!["1.2.3.4:443".to_string()])
             .username("alice".to_string())
             .password("secret".to_string())
             .client_random_auth_key(Some("aabbccdd".to_string()))
-            .build()
-            .unwrap();
+            .build()?;
 
-        let uri = crate::encode::encode(&config).unwrap();
-        let decoded = crate::decode(&uri).unwrap();
-        assert_eq!(decoded.client_random_auth_key, Some("aabbccdd".to_string()));
+        let uri = crate::encode::encode(&config)?;
+        let decoded = crate::decode(&uri)?;
+        prop_assert_eq!(decoded.client_random_auth_key, Some("aabbccdd".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_none_omitted() {
+    fn test_auth_key_none_omitted() -> TestResult {
         let config = DeepLinkConfig::builder()
             .hostname("vpn.example.com".to_string())
             .addresses(vec!["1.2.3.4:443".to_string()])
             .username("alice".to_string())
             .password("secret".to_string())
-            .build()
-            .unwrap();
+            .build()?;
 
-        let uri = crate::encode::encode(&config).unwrap();
-        let decoded = crate::decode(&uri).unwrap();
-        assert_eq!(decoded.client_random_auth_key, None);
+        let uri = crate::encode::encode(&config)?;
+        let decoded = crate::decode(&uri)?;
+        prop_assert_eq!(decoded.client_random_auth_key, None);
+        Ok(())
     }
 
     #[test]
-    fn test_auth_key_invalid_hex_decode() {
+    fn test_auth_key_invalid_hex_decode() -> TestResult {
         let mut parser = TlvParser::new(&[0x0F, 0x07, b'n', b'o', b't', b'h', b'e', b'x', b'x']);
-        let (tag, value) = parser.next_field().unwrap().unwrap();
-        assert_eq!(tag, Some(TlvTag::ClientRandomAuthKey));
-        let result = hex::decode(String::from_utf8(value).unwrap());
-        assert!(result.is_err());
+        let (tag, value) = parser
+            .next_field()
+            .ok_or_else(|| proptest::test_runner::TestCaseError::fail("expected a TLV field"))??;
+        prop_assert_eq!(tag, Some(TlvTag::ClientRandomAuthKey));
+        let result = hex::decode(String::from_utf8(value)?);
+        prop_assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_empty_string_fields_roundtrip() {
+    fn test_empty_string_fields_roundtrip() -> TestResult {
         let config = DeepLinkConfig {
             hostname: Some("vpn.example.com".to_string()),
             addresses: vec!["1.2.3.4:443".to_string()],
@@ -531,12 +600,13 @@ mod tests {
             subscription_url: None,
         };
 
-        let uri = crate::encode::encode(&config).unwrap();
-        let decoded = crate::decode(&uri).unwrap();
+        let uri = crate::encode::encode(&config)?;
+        let decoded = crate::decode(&uri)?;
 
         // Some("") encodes as "field omitted" (empty strings are skipped for
         // prefix and auth key), so decode returns None. This documents that behavior.
-        assert_eq!(decoded.client_random_prefix, None);
-        assert_eq!(decoded.client_random_auth_key, None);
+        prop_assert_eq!(decoded.client_random_prefix, None);
+        prop_assert_eq!(decoded.client_random_auth_key, None);
+        Ok(())
     }
 }

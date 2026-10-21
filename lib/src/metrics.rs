@@ -17,8 +17,8 @@ const HEALTH_CHECK_PATH: &str = "/health-check";
 const METRICS_PATH: &str = "/metrics";
 const CLIENTS_PATH: &str = "/clients";
 
-pub(crate) struct Metrics {
-    _registry: prometheus::Registry,
+pub struct Metrics {
+    registry: prometheus::Registry,
     per_client: bool,
     client_sessions: prometheus::IntGaugeVec,
     inbound_traffic: prometheus::IntCounterVec,
@@ -47,17 +47,17 @@ struct ClientSummary {
     outbound: u64,
 }
 
-pub(crate) struct ClientSessionsCounter {
+pub struct ClientSessionsCounter {
     metrics: Arc<Metrics>,
     protocol: Protocol,
     conn_id: String,
 }
 
-pub(crate) struct OutboundTcpSocketCounter {
+pub struct OutboundTcpSocketCounter {
     metrics: Arc<Metrics>,
 }
 
-pub(crate) struct OutboundUdpSocketCounter {
+pub struct OutboundUdpSocketCounter {
     metrics: Arc<Metrics>,
 }
 
@@ -120,12 +120,12 @@ impl Metrics {
                 registry,
             )
             .map_err(prometheus_to_io_error)?,
-            _registry: registry,
+            registry,
             clients: Mutex::new(HashMap::new()),
         }))
     }
 
-    pub fn per_client(&self) -> bool {
+    pub const fn per_client(&self) -> bool {
         self.per_client
     }
 
@@ -172,15 +172,17 @@ impl Metrics {
         }
     }
 
-    fn collect(&self) -> (String, Bytes) {
+    fn collect(&self) -> io::Result<(String, Bytes)> {
         let encoder = prometheus::TextEncoder::new();
 
-        let mut metric_families = self._registry.gather();
+        let mut metric_families = self.registry.gather();
         metric_families.extend(prometheus::gather());
         let mut buffer = vec![];
-        encoder.encode(&metric_families, &mut buffer).unwrap();
+        encoder
+            .encode(&metric_families, &mut buffer)
+            .map_err(prometheus_to_io_error)?;
 
-        (encoder.format_type().to_string(), Bytes::from(buffer))
+        Ok((encoder.format_type().to_string(), Bytes::from(buffer)))
     }
 
     /// Seed the metadata entry for a connection. Only sets the client IP; the
@@ -242,7 +244,7 @@ impl Metrics {
         let mut agg: HashMap<String, ClientSummary> = HashMap::new();
 
         for uname in configured_usernames {
-            agg.entry(uname.clone()).or_insert(ClientSummary {
+            agg.entry(uname.clone()).or_insert_with(|| ClientSummary {
                 username: uname.clone(),
                 ip: None,
                 sessions: 0,
@@ -252,10 +254,10 @@ impl Metrics {
         }
 
         if let Ok(clients_map) = self.clients.lock() {
-            for (_id, info) in clients_map.iter() {
+            for info in clients_map.values() {
                 let uname = info.username.clone().unwrap_or_default();
-                let entry = agg.entry(uname.clone()).or_insert(ClientSummary {
-                    username: uname.clone(),
+                let entry = agg.entry(uname.clone()).or_insert_with(|| ClientSummary {
+                    username: uname,
                     ip: info.ip.map(|x| x.to_string()),
                     sessions: 0,
                     inbound: 0,
@@ -274,13 +276,11 @@ impl Metrics {
                 summary.inbound = self
                     .inbound_traffic_per_user
                     .get_metric_with_label_values(&[&summary.username])
-                    .map(|c| c.get())
-                    .unwrap_or(0);
+                    .map_or(0, |c| c.get());
                 summary.outbound = self
                     .outbound_traffic_per_user
                     .get_metric_with_label_values(&[&summary.username])
-                    .map(|c| c.get())
-                    .unwrap_or(0);
+                    .map_or(0, |c| c.get());
             }
         }
         summaries
@@ -315,7 +315,7 @@ impl ClientSessionsCounter {
         }
 
         Self {
-            metrics: metrics.clone(),
+            metrics,
             protocol,
             conn_id,
         }
@@ -368,20 +368,23 @@ impl Drop for OutboundUdpSocketCounter {
     }
 }
 
-pub(crate) async fn listen(
+pub async fn listen(
     context: Arc<core::Context>,
     log_chain: log_utils::IdChain<u64>,
 ) -> io::Result<()> {
     let (mut shutdown_notification, _shutdown_completion) = {
-        let shutdown = context.shutdown.lock().unwrap();
+        let shutdown = context
+            .shutdown
+            .lock()
+            .map_err(|e| io::Error::other(e.to_string()))?;
         (shutdown.notification_handler(), shutdown.completion_guard())
     };
 
     tokio::select! {
         x = shutdown_notification.wait() => {
             match x {
-                Ok(_) => Ok(()),
-                Err(e) => Err(io::Error::other(format!("{}", e))),
+                Ok(()) => Ok(()),
+                Err(e) => Err(io::Error::other(e.to_string())),
             }
         }
         x = listen_inner(context, log_chain) => x,
@@ -392,13 +395,13 @@ async fn listen_inner(
     context: Arc<core::Context>,
     log_chain: log_utils::IdChain<u64>,
 ) -> io::Result<()> {
-    let settings = context.settings.metrics.as_ref();
-    if settings.is_none() {
+    let Some(settings) = context.settings.metrics.as_ref() else {
         return Ok(());
-    }
+    };
 
     let next_id = AtomicU64::default();
-    let listener = TcpListener::bind(settings.unwrap().address).await?;
+    let listener = TcpListener::bind(settings.address).await?;
+    let timeout = settings.request_timeout;
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -408,7 +411,7 @@ async fn listen_inner(
         ));
         log_id!(trace, log_id, "New connection from {}", peer);
         let context = context.clone();
-        tokio::spawn(async move { handle_request(context, stream, log_id).await });
+        tokio::spawn(async move { handle_request(context, stream, log_id, timeout).await });
     }
 }
 
@@ -416,9 +419,15 @@ async fn handle_request(
     context: Arc<core::Context>,
     io: TcpStream,
     log_id: log_utils::IdChain<u64>,
+    timeout: std::time::Duration,
 ) {
-    let mut codec = Http1Codec::new(context.settings.clone(), io, log_id.clone());
-    let timeout = context.settings.metrics.as_ref().unwrap().request_timeout;
+    let mut codec = match Http1Codec::new(&context.settings, io, log_id.clone()) {
+        Ok(codec) => codec,
+        Err(e) => {
+            log_id!(debug, log_id, "Failed to create HTTP codec: {}", e);
+            return;
+        }
+    };
     let stream = match tokio::time::timeout(timeout, codec.listen()).await {
         Ok(Ok(Some(x))) => {
             log_id!(trace, log_id, "Got request: {:?}", x.request().request());
@@ -479,8 +488,8 @@ async fn handle_request(
     };
 
     tokio::select! {
-        _ = dispatch => (),
-        _ = handle => (),
+        () = dispatch => (),
+        () = handle => (),
     }
 
     if let Err(e) = codec.graceful_shutdown().await {
@@ -508,22 +517,19 @@ async fn handle_clients_collect(
         .iter()
         .map(|c| c.username.clone())
         .collect();
-    let content_vec = match serde_json::to_vec(&metrics.clients_summary(&configured_usernames)) {
-        Ok(v) => v,
-        Err(_) => {
-            let respond = stream.split().1;
-            return respond
-                .send_bad_response(http::status::StatusCode::INTERNAL_SERVER_ERROR, vec![]);
-        }
+    let Ok(content_vec) = serde_json::to_vec(&metrics.clients_summary(&configured_usernames))
+    else {
+        let respond = stream.split().1;
+        return respond.send_bad_response(http::status::StatusCode::INTERNAL_SERVER_ERROR, vec![]);
     };
-    let mut content = Bytes::from(content_vec);
+    let mut body = Bytes::from(content_vec);
     let response = http::Response::builder()
         .version(stream.request().request().version)
         .status(http::status::StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "application/json")
-        .header(http::header::CONTENT_LENGTH, content.len())
+        .header(http::header::CONTENT_LENGTH, body.len())
         .body(())
-        .unwrap()
+        .map_err(io::Error::other)?
         .into_parts()
         .0;
 
@@ -533,8 +539,8 @@ async fn handle_clients_collect(
         .send_response(response, false)?
         .into_pipe_sink();
 
-    while !content.is_empty() {
-        content = sink.write(content)?;
+    while !body.is_empty() {
+        body = sink.write(body)?;
         sink.wait_writable().await?;
     }
 
@@ -545,14 +551,14 @@ async fn handle_metrics_collect(
     metrics: &Metrics,
     stream: Box<dyn http_codec::Stream>,
 ) -> io::Result<()> {
-    let (content_type, mut content) = metrics.collect();
+    let (content_type, mut content) = metrics.collect()?;
     let response = http::Response::builder()
         .version(stream.request().request().version)
         .status(http::status::StatusCode::OK)
         .header(http::header::CONTENT_TYPE, content_type)
         .header(http::header::CONTENT_LENGTH, content.len())
         .body(())
-        .unwrap()
+        .map_err(io::Error::other)?
         .into_parts()
         .0;
 
@@ -580,116 +586,186 @@ fn prometheus_to_io_error(e: prometheus::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::check;
 
-    fn metrics(per_client: bool) -> Arc<Metrics> {
-        Metrics::new(per_client).unwrap()
+    fn metrics(per_client: bool) -> io::Result<Arc<Metrics>> {
+        Metrics::new(per_client)
     }
 
-    fn output(metrics: &Metrics) -> String {
-        let (_, body) = metrics.collect();
-        String::from_utf8(body.to_vec()).unwrap()
+    fn output(metrics: &Metrics) -> io::Result<String> {
+        let (_, body) = metrics.collect()?;
+        String::from_utf8(body.to_vec()).map_err(io::Error::other)
     }
 
     #[test]
-    fn per_user_bytes_recorded_when_enabled() {
-        let m = metrics(true);
+    fn per_user_bytes_recorded_when_enabled() -> io::Result<()> {
+        let m = metrics(true)?;
         m.add_inbound_bytes(Protocol::Http2, Some("alice"), 100);
         m.add_outbound_bytes(Protocol::Http2, Some("alice"), 200);
 
-        let out = output(&m);
-        assert!(out.contains("inbound_traffic_bytes{protocol_type=\"HTTP2\"} 100"));
-        assert!(out.contains("outbound_traffic_bytes{protocol_type=\"HTTP2\"} 200"));
-        assert!(out.contains("inbound_traffic_bytes_per_user{username=\"alice\"} 100"));
-        assert!(out.contains("outbound_traffic_bytes_per_user{username=\"alice\"} 200"));
+        let out = output(&m)?;
+        check(
+            out.contains("inbound_traffic_bytes{protocol_type=\"HTTP2\"} 100"),
+            "missing inbound total",
+        )?;
+        check(
+            out.contains("outbound_traffic_bytes{protocol_type=\"HTTP2\"} 200"),
+            "missing outbound total",
+        )?;
+        check(
+            out.contains("inbound_traffic_bytes_per_user{username=\"alice\"} 100"),
+            "missing per-user inbound total",
+        )?;
+        check(
+            out.contains("outbound_traffic_bytes_per_user{username=\"alice\"} 200"),
+            "missing per-user outbound total",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn per_user_bytes_not_recorded_when_disabled() {
-        let m = metrics(false);
+    fn per_user_bytes_not_recorded_when_disabled() -> io::Result<()> {
+        let m = metrics(false)?;
         m.add_inbound_bytes(Protocol::Http2, Some("alice"), 100);
         m.add_outbound_bytes(Protocol::Http2, Some("alice"), 200);
 
-        let out = output(&m);
-        assert!(out.contains("inbound_traffic_bytes{protocol_type=\"HTTP2\"} 100"));
-        assert!(!out.contains("_per_user"));
+        let out = output(&m)?;
+        check(
+            out.contains("inbound_traffic_bytes{protocol_type=\"HTTP2\"} 100"),
+            "missing inbound total",
+        )?;
+        check(
+            !out.contains("_per_user"),
+            "disabled per-user metrics were recorded",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn session_guard_balances_gauges_on_drop() {
-        let m = metrics(true);
+    fn session_guard_balances_gauges_on_drop() -> io::Result<()> {
+        let m = metrics(true)?;
         {
             let _guard = m.clone().client_sessions_counter(
                 Protocol::Http2,
                 "conn1".into(),
                 Some("alice".into()),
             );
-            let out = output(&m);
-            assert!(out.contains("client_sessions{protocol_type=\"HTTP2\"} 1"));
-            assert!(out.contains(
-                "client_sessions_per_user{protocol_type=\"HTTP2\",username=\"alice\"} 1"
-            ));
-            assert!(m.clients.lock().unwrap().contains_key("conn1"));
+            let out = output(&m)?;
+            check(
+                out.contains("client_sessions{protocol_type=\"HTTP2\"} 1"),
+                "session gauge was not incremented",
+            )?;
+            check(
+                out.contains(
+                    "client_sessions_per_user{protocol_type=\"HTTP2\",username=\"alice\"} 1",
+                ),
+                "per-user session gauge was not incremented",
+            )?;
+            check(
+                m.clients
+                    .lock()
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                    .contains_key("conn1"),
+                "active connection was not registered",
+            )?;
         }
 
-        let out = output(&m);
-        assert!(out.contains("client_sessions{protocol_type=\"HTTP2\"} 0"));
-        assert!(
-            out.contains("client_sessions_per_user{protocol_type=\"HTTP2\",username=\"alice\"} 0")
-        );
-        assert!(!m.clients.lock().unwrap().contains_key("conn1"));
+        let out = output(&m)?;
+        check(
+            out.contains("client_sessions{protocol_type=\"HTTP2\"} 0"),
+            "session gauge was not decremented",
+        )?;
+        check(
+            out.contains("client_sessions_per_user{protocol_type=\"HTTP2\",username=\"alice\"} 0"),
+            "per-user session gauge was not decremented",
+        )?;
+        check(
+            !m.clients
+                .lock()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .contains_key("conn1"),
+            "dropped connection remains registered",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn session_guard_disabled_does_not_touch_per_user() {
-        let m = metrics(false);
+    fn session_guard_disabled_does_not_touch_per_user() -> io::Result<()> {
+        let m = metrics(false)?;
         {
             let _guard = m.clone().client_sessions_counter(
                 Protocol::Http2,
                 "conn1".into(),
                 Some("alice".into()),
             );
-            let out = output(&m);
-            assert!(out.contains("client_sessions{protocol_type=\"HTTP2\"} 1"));
-            assert!(!out.contains("_per_user"));
+            let out = output(&m)?;
+            check(
+                out.contains("client_sessions{protocol_type=\"HTTP2\"} 1"),
+                "session gauge was not incremented",
+            )?;
+            check(
+                !out.contains("_per_user"),
+                "disabled per-user session was recorded",
+            )?;
         }
+        Ok(())
     }
 
     #[test]
-    fn transfer_session_username_relabels_gauge() {
-        let m = metrics(true);
+    fn transfer_session_username_relabels_gauge() -> io::Result<()> {
+        let m = metrics(true)?;
         let _guard = m
             .clone()
             .client_sessions_counter(Protocol::Http2, "conn1".into(), None);
 
         m.transfer_session_username(Protocol::Http2, "conn1", Some("bob".into()));
-        let out = output(&m);
-        assert!(
-            out.contains("client_sessions_per_user{protocol_type=\"HTTP2\",username=\"bob\"} 1")
-        );
-        assert!(out.contains("client_sessions_per_user{protocol_type=\"HTTP2\",username=\"\"} 0"));
+        let out = output(&m)?;
+        check(
+            out.contains("client_sessions_per_user{protocol_type=\"HTTP2\",username=\"bob\"} 1"),
+            "new username session gauge was not incremented",
+        )?;
+        check(
+            out.contains("client_sessions_per_user{protocol_type=\"HTTP2\",username=\"\"} 0"),
+            "old username session gauge was not decremented",
+        )?;
 
         // Transferring to the same username is a no-op.
         m.transfer_session_username(Protocol::Http2, "conn1", Some("bob".into()));
-        let out = output(&m);
-        assert!(
-            out.contains("client_sessions_per_user{protocol_type=\"HTTP2\",username=\"bob\"} 1")
-        );
+        let out = output(&m)?;
+        check(
+            out.contains("client_sessions_per_user{protocol_type=\"HTTP2\",username=\"bob\"} 1"),
+            "unchanged username unbalanced session gauge",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn unregister_without_guard_is_safe() {
-        let m = metrics(true);
-        m.register_connection("conn1".into(), Some("127.0.0.1".parse().unwrap()));
-        assert!(m.clients.lock().unwrap().contains_key("conn1"));
+    fn unregister_without_guard_is_safe() -> io::Result<()> {
+        let m = metrics(true)?;
+        m.register_connection("conn1".into(), Some(std::net::Ipv4Addr::LOCALHOST.into()));
+        check(
+            m.clients
+                .lock()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .contains_key("conn1"),
+            "connection was not registered",
+        )?;
 
         m.unregister_connection("conn1");
-        assert!(!m.clients.lock().unwrap().contains_key("conn1"));
+        check(
+            !m.clients
+                .lock()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .contains_key("conn1"),
+            "connection was not unregistered",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn clients_summary_merges_configured_and_runtime() {
-        let m = metrics(true);
-        m.register_connection("conn1".into(), Some("127.0.0.1".parse().unwrap()));
+    fn clients_summary_merges_configured_and_runtime() -> io::Result<()> {
+        let m = metrics(true)?;
+        m.register_connection("conn1".into(), Some(std::net::Ipv4Addr::LOCALHOST.into()));
         let _guard = m.clone().client_sessions_counter(
             Protocol::Http2,
             "conn1".into(),
@@ -701,29 +777,46 @@ mod tests {
         let configured = vec!["alice".to_string(), "bob".to_string()];
         let summaries = m.clients_summary(&configured);
 
-        let alice = summaries.iter().find(|s| s.username == "alice").unwrap();
-        assert_eq!(alice.sessions, 1);
-        assert_eq!(alice.inbound, 42);
-        assert_eq!(alice.outbound, 7);
-        assert_eq!(alice.ip.as_deref(), Some("127.0.0.1"));
+        let alice = summaries
+            .iter()
+            .find(|s| s.username == "alice")
+            .ok_or_else(|| io::Error::other("missing alice summary"))?;
+        check(alice.sessions == 1, "wrong active session count")?;
+        check(alice.inbound == 42, "wrong active inbound bytes")?;
+        check(alice.outbound == 7, "wrong active outbound bytes")?;
+        check(alice.ip.as_deref() == Some("127.0.0.1"), "wrong active IP")?;
 
-        let bob = summaries.iter().find(|s| s.username == "bob").unwrap();
-        assert_eq!(bob.sessions, 0);
-        assert_eq!(bob.inbound, 0);
-        assert_eq!(bob.outbound, 0);
-        assert_eq!(bob.ip, None);
+        let bob = summaries
+            .iter()
+            .find(|s| s.username == "bob")
+            .ok_or_else(|| io::Error::other("missing bob summary"))?;
+        check(bob.sessions == 0, "idle client has sessions")?;
+        check(bob.inbound == 0, "idle client has inbound bytes")?;
+        check(bob.outbound == 0, "idle client has outbound bytes")?;
+        check(bob.ip.is_none(), "idle client has an IP")?;
+        Ok(())
     }
 
     #[test]
-    fn clients_summary_shows_zeroes_when_disabled() {
-        let m = metrics(false);
+    fn clients_summary_shows_zeroes_when_disabled() -> io::Result<()> {
+        let m = metrics(false)?;
         let configured = vec!["alice".to_string()];
         let summaries = m.clients_summary(&configured);
 
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].username, "alice");
-        assert_eq!(summaries[0].sessions, 0);
-        assert_eq!(summaries[0].inbound, 0);
-        assert_eq!(summaries[0].outbound, 0);
+        check(summaries.len() == 1, "wrong configured summary count")?;
+        check(
+            summaries[0].username == "alice",
+            "wrong configured username",
+        )?;
+        check(summaries[0].sessions == 0, "disabled summary has sessions")?;
+        check(
+            summaries[0].inbound == 0,
+            "disabled summary has inbound bytes",
+        )?;
+        check(
+            summaries[0].outbound == 0,
+            "disabled summary has outbound bytes",
+        )?;
+        Ok(())
     }
 }

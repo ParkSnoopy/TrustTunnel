@@ -1,3 +1,5 @@
+//! Subscription configuration, validation, and response data.
+
 use crate::settings::{Settings, TlsHostInfo, TlsHostsSettings, ValidationError};
 
 /// The `[subscription]` settings parsed from `vpn.toml`.
@@ -35,7 +37,19 @@ pub struct SubscriptionSettings {
     pub client_random_prefix: Option<String>,
 }
 
+impl std::fmt::Debug for SubscriptionSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubscriptionSettings")
+            .field("enabled", &self.enabled)
+            .field("hostname", &self.hostname)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SubscriptionSettings {
+    /// Return the default subscription request path.
+    #[must_use]
     pub fn default_path() -> String {
         "/subscription".to_string()
     }
@@ -164,9 +178,12 @@ pub(crate) struct SubscriptionResponse<'a> {
 
 /// Validate `sub` against the endpoint and TLS hosts settings.
 ///
-/// Runs the field checks ([`validate`]) and verifies that `hostname` matches a
+/// Runs the field checks (`validate`) and verifies that `hostname` matches a
 /// `main_hosts` entry, returning the matched host. Does not read certificate
 /// files, so it is cheap enough to run on every endpoint invocation.
+///
+/// # Errors
+/// Returns an error for invalid fields, overlapping paths, or an unknown TLS hostname.
 pub fn validate_with_hosts<'a>(
     sub: &SubscriptionSettings,
     settings: &Settings,
@@ -199,9 +216,7 @@ pub(crate) fn resolve(
     let host = validate_with_hosts(sub, settings, hosts)?;
 
     let system_verifiable = crate::cert_verification::CertificateVerifier::new()
-        .ok()
-        .map(|verifier| verifier.is_system_verifiable(&host.cert_chain_path, &host.hostname))
-        .unwrap_or(false);
+        .is_ok_and(|verifier| verifier.is_system_verifiable(&host.cert_chain_path, &host.hostname));
 
     let certificate = if system_verifiable {
         None
@@ -252,21 +267,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_defaults_when_minimal() {
+    fn parse_defaults_when_minimal() -> Result<(), Box<dyn std::error::Error>> {
         let toml = "[subscription]\nenabled = true\n";
-        let w: Wrapper = toml::from_str(toml).unwrap();
-        let sub = w.subscription.expect("section present");
-        assert!(sub.enabled);
-        assert_eq!(sub.path, "/subscription");
-        assert_eq!(sub.hostname, None);
-        assert_eq!(sub.address, None);
-        assert!(sub.dns_upstreams.is_empty());
+        let w: Wrapper = toml::from_str(toml)?;
+        let sub = w.subscription.ok_or("section absent")?;
+        if !(sub.enabled) {
+            return Err(format!("assertion failed: {}", stringify!(sub.enabled)).into());
+        }
+        let (actual, expected) = (&(sub.path), &("/subscription"));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        let (actual, expected) = (&(sub.hostname), &(None));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        let (actual, expected) = (&(sub.address), &(None));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        if !(sub.dns_upstreams.is_empty()) {
+            return Err(format!(
+                "assertion failed: {}",
+                stringify!(sub.dns_upstreams.is_empty())
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn parse_absent_section_is_none() {
-        let w: Wrapper = toml::from_str("").unwrap();
-        assert!(w.subscription.is_none());
+    fn parse_absent_section_is_none() -> Result<(), Box<dyn std::error::Error>> {
+        let w: Wrapper = toml::from_str("")?;
+        if w.subscription.is_some() {
+            return Err(
+                format!("assertion failed: {}", stringify!(w.subscription.is_none())).into(),
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -363,24 +413,28 @@ mod tests {
     }
 
     fn tls_hosts_with(hostname: &str) -> TlsHostsSettings {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("trusttunnel_sub_test_cert_{id}.pem"));
-        std::fs::write(&tmp, b"").unwrap();
-        let path = tmp.to_str().unwrap();
-        toml::from_str(&format!(
-            "[[main_hosts]]\nhostname = \"{hostname}\"\ncert_chain_path = \"{path}\"\nprivate_key_path = \"{path}\"\n"
-        ))
-        .unwrap()
+        let mut hosts = TlsHostsSettings::default();
+        hosts.main_hosts.push(TlsHostInfo {
+            hostname: hostname.to_owned(),
+            ..TlsHostInfo::default()
+        });
+        hosts
     }
 
     #[test]
-    fn validate_with_hosts_returns_matching_host() {
+    fn validate_with_hosts_returns_matching_host() -> Result<(), Box<dyn std::error::Error>> {
         let hosts = tls_hosts_with("vpn.example.com");
         let settings = Settings::default();
-        let host = validate_with_hosts(&enabled_sub(), &settings, &hosts).unwrap();
-        assert_eq!(host.hostname, "vpn.example.com");
+        let host = validate_with_hosts(&enabled_sub(), &settings, &hosts)?;
+        let (actual, expected) = (&(host.hostname), &("vpn.example.com"));
+        if actual != expected {
+            return Err(format!(
+                "{} (left: {actual:?}, right: {expected:?})",
+                "assertion failed"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     #[test]
@@ -400,5 +454,13 @@ mod tests {
         let hosts = tls_hosts_with("vpn.example.com");
         let settings = Settings::default();
         assert!(validate_with_hosts(&sub, &settings, &hosts).is_err());
+    }
+
+    #[test]
+    fn debug_scrubs_custom_sni() {
+        let mut sub = enabled_sub();
+        sub.custom_sni = Some("secret_credentials.vpn.example.com".into());
+        let debug = format!("{sub:?}");
+        assert!(!debug.contains("secret_credentials"));
     }
 }

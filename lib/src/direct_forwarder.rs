@@ -6,12 +6,12 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-pub(crate) struct DirectForwarder {
+pub struct DirectForwarder {
     context: Arc<core::Context>,
 }
 
 impl DirectForwarder {
-    pub fn new(context: Arc<core::Context>) -> Self {
+    pub const fn new(context: Arc<core::Context>) -> Self {
         Self { context }
     }
 }
@@ -45,7 +45,7 @@ impl Forwarder for DirectForwarder {
         id: log_utils::IdChain<u64>,
         _: forwarder::UdpMultiplexerMeta,
     ) -> io::Result<UdpMultiplexer> {
-        udp_forwarder::make_multiplexer(self.context.clone(), id)
+        Ok(udp_forwarder::make_multiplexer(self.context.clone(), id))
     }
 
     fn make_icmp_datagram_multiplexer(

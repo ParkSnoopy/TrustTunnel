@@ -1,9 +1,10 @@
+//! Regression tests for runtime documentation on structs.
+
 use macros::RuntimeDoc;
 
 #[test]
 fn slashed() {
     /// Trololo
-    #[allow(dead_code)]
     #[derive(RuntimeDoc)]
     struct Foo {
         /// Haha
@@ -12,12 +13,12 @@ fn slashed() {
 
     assert_eq!(Foo::doc(), "Trololo");
     assert_eq!(Foo::doc_x(), "Haha");
+    assert_eq!(Foo { x: 42 }.x, 42);
 }
 
 #[test]
 fn doc_attr() {
     #[doc = "Trololo"]
-    #[allow(dead_code)]
     #[derive(RuntimeDoc)]
     struct Foo {
         #[doc = "Haha"]
@@ -26,13 +27,13 @@ fn doc_attr() {
 
     assert_eq!(Foo::doc(), "Trololo");
     assert_eq!(Foo::doc_x(), "Haha");
+    assert_eq!(Foo { x: 42 }.x, 42);
 }
 
 #[test]
 fn mixed() {
     /// - How much watch?
     #[doc = "- Six watch"]
-    #[allow(dead_code)]
     #[derive(RuntimeDoc)]
     struct Foo {
         /// - Such much?
@@ -42,12 +43,13 @@ fn mixed() {
 
     assert_eq!(
         Foo::doc(),
-        r#"- How much watch?
-- Six watch"#
+        r"- How much watch?
+- Six watch"
     );
     assert_eq!(
         Foo::doc_x(),
-        r#"- Such much?
-- For whom how"#
+        r"- Such much?
+- For whom how"
     );
+    assert_eq!(Foo { x: 42 }.x, 42);
 }

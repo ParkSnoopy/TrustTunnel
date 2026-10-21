@@ -1,3 +1,5 @@
+//! Endpoint initialization, listener routing, and live reloads.
+
 use crate::connection_limiter::ConnectionLimiter;
 use crate::direct_forwarder::DirectForwarder;
 use crate::forwarder::Forwarder;
@@ -29,6 +31,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 
+/// Endpoint validation or initialization failure.
 #[derive(Debug)]
 pub enum Error {
     /// Passed settings did not pass the validation
@@ -39,8 +42,36 @@ pub enum Error {
     Metrics(String),
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SettingsValidation(error) => write!(f, "Settings validation failed: {error}"),
+            Self::TlsDemultiplexer(error) => {
+                write!(f, "TLS demultiplexer initialization failed: {error}")
+            }
+            Self::Metrics(error) => write!(f, "Metrics initialization failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SettingsValidation(error) => Some(error),
+            Self::TlsDemultiplexer(_) | Self::Metrics(_) => None,
+        }
+    }
+}
+
+/// An initialized VPN endpoint and its shared connection state.
 pub struct Core {
     context: Arc<Context>,
+}
+
+impl std::fmt::Debug for Core {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Core").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,8 +109,8 @@ pub(crate) struct Context {
     pub icmp_forwarder: Option<Arc<IcmpForwarder>>,
     pub shutdown: Arc<Mutex<Shutdown>>,
     /// Channel for propagating fatal IO errors (e.g., EMFILE/ENFILE) from spawned tasks
-    /// to the main Core::listen() loop.
-    /// Spawned tasks report errors via Context::report_fatal_io_error().
+    /// to the main `Core::listen()` loop.
+    /// Spawned tasks report errors via `Context::report_fatal_io_error()`.
     fatal_error: watch::Sender<Option<FatalIoError>>,
     pub metrics: Arc<Metrics>,
     next_client_id: Arc<AtomicU64>,
@@ -89,7 +120,13 @@ pub(crate) struct Context {
 
 impl Context {
     pub(crate) fn report_fatal_io_error(&self, e: &io::Error) {
-        let _ = self.fatal_error.send(Some(FatalIoError::from_io_error(e)));
+        if self
+            .fatal_error
+            .send(Some(FatalIoError::from_io_error(e)))
+            .is_err()
+        {
+            log::warn!("Fatal I/O error reported without an active listener: {e}");
+        }
     }
 }
 
@@ -101,10 +138,14 @@ impl Core {
         )
     }
 
+    /// Initialize an endpoint from validated settings and TLS hosts.
+    ///
+    /// # Errors
+    /// Returns an error when settings, TLS demultiplexing, or metrics initialization fails.
     pub fn new(
         settings: Settings,
         authenticator: Option<Arc<dyn authentication::Authenticator>>,
-        tls_hosts_settings: settings::TlsHostsSettings,
+        tls_hosts_settings: &settings::TlsHostsSettings,
         shutdown: Arc<Mutex<Shutdown>>,
     ) -> Result<Self, Error> {
         if !settings.is_built() {
@@ -138,7 +179,7 @@ impl Core {
 
         let subscription = match settings.subscription.as_ref() {
             Some(sub) => Some(
-                crate::subscription::resolve(sub, &settings, &tls_hosts_settings)
+                crate::subscription::resolve(sub, &settings, tls_hosts_settings)
                     .map_err(Error::SettingsValidation)?,
             ),
             None => None,
@@ -146,16 +187,15 @@ impl Core {
         let per_client_metrics = settings
             .metrics
             .as_ref()
-            .map(|m| m.per_client_metrics)
-            .unwrap_or(false);
+            .is_some_and(|m| m.per_client_metrics);
 
         Ok(Self {
             context: Arc::new(Context {
-                settings: settings.clone(),
+                settings: Arc::clone(&settings),
                 authenticator,
                 subscription: Arc::new(std::sync::RwLock::new(subscription)),
                 tls_demux: Arc::new(RwLock::new(
-                    TlsDemux::new(&settings, &tls_hosts_settings)
+                    TlsDemux::new(&settings, tls_hosts_settings)
                         .map_err(|e| Error::TlsDemultiplexer(e.to_string()))?,
                 )),
                 icmp_forwarder: if settings.icmp.is_none() {
@@ -167,41 +207,48 @@ impl Core {
                 fatal_error,
                 metrics: Metrics::new(per_client_metrics)
                     .map_err(|e| Error::Metrics(e.to_string()))?,
-                next_client_id: Default::default(),
-                next_tunnel_id: Default::default(),
+                next_client_id: Arc::default(),
+                next_tunnel_id: Arc::default(),
                 connection_limiter,
             }),
         })
     }
 
     /// Run an endpoint instance inside the caller provided asynchronous runtime.
+    ///
+    /// # Errors
+    /// Returns listener, shutdown, or fatal connection I/O failures.
     pub async fn listen(&self) -> io::Result<()> {
         let listen_tcp = async {
             self.listen_tcp()
                 .await
-                .map_err(|e| io::Error::new(e.kind(), format!("TCP listener failure: {}", e)))
+                .map_err(|e| io::Error::new(e.kind(), format!("TCP listener failure: {e}")))
         };
 
         let listen_udp = async {
             self.listen_udp()
                 .await
-                .map_err(|e| io::Error::new(e.kind(), format!("UDP listener failure: {}", e)))
+                .map_err(|e| io::Error::new(e.kind(), format!("UDP listener failure: {e}")))
         };
 
         let listen_icmp = async {
             self.listen_icmp()
                 .await
-                .map_err(|e| io::Error::new(e.kind(), format!("ICMP listener failure: {}", e)))
+                .map_err(|e| io::Error::new(e.kind(), format!("ICMP listener failure: {e}")))
         };
 
         let listen_metrics = async {
             metrics::listen(self.context.clone(), log_utils::IdChain::empty())
                 .await
-                .map_err(|e| io::Error::new(e.kind(), format!("Metrics listener failure: {}", e)))
+                .map_err(|e| io::Error::new(e.kind(), format!("Metrics listener failure: {e}")))
         };
 
         let (mut shutdown_notification, _shutdown_completion) = {
-            let shutdown = self.context.shutdown.lock().unwrap();
+            let shutdown = self
+                .context
+                .shutdown
+                .lock()
+                .map_err(|error| io::Error::other(error.to_string()))?;
             (
                 shutdown.notification_handler(),
                 shutdown
@@ -214,12 +261,15 @@ impl Core {
 
         tokio::select! {
             x = shutdown_notification.wait() => {
-                x.map_err(|e| io::Error::other(format!("{}", e)))
+                x.map_err(|e| io::Error::other(e.to_string()))
             },
             x = fatal_error_rx.changed() => match x {
-                Ok(()) => match fatal_error_rx.borrow().clone() {
-                    Some(e) => Err(e.into_io_error()),
-                    None => Err(io::Error::other("Unknown fatal error reported")),
+                Ok(()) => {
+                    let error = fatal_error_rx.borrow().clone();
+                    error.map_or_else(
+                        || Err(io::Error::other("Unknown fatal error reported")),
+                        |error| Err(error.into_io_error()),
+                    )
                 },
                 Err(_) => Err(io::Error::other("Fatal error channel is unexpectedly closed")),
             },
@@ -233,19 +283,27 @@ impl Core {
     }
 
     /// Reload the TLS hosts settings
+    ///
+    /// # Errors
+    /// Returns an error for invalid hosts, unreadable identities, or a poisoned state lock.
     pub fn reload_tls_hosts_settings(
         &self,
-        settings: settings::TlsHostsSettings,
+        settings: &settings::TlsHostsSettings,
     ) -> io::Result<()> {
-        let mut demux = self.context.tls_demux.write().unwrap();
+        let mut demux = self
+            .context
+            .tls_demux
+            .write()
+            .map_err(|error| io::Error::other(error.to_string()))?;
 
         if !settings.is_built() {
             settings
                 .validate()
-                .map_err(|e| io::Error::other(format!("Settings validation failure: {:?}", e)))?;
+                .map_err(|e| io::Error::other(format!("Settings validation failure: {e:?}")))?;
         }
 
-        *demux = TlsDemux::new(&self.context.settings, &settings)?;
+        *demux = TlsDemux::new(&self.context.settings, settings)?;
+        drop(demux);
         Ok(())
     }
 
@@ -254,6 +312,9 @@ impl Core {
     /// `sub` is the freshly parsed `[subscription]` section (or `None` when the
     /// section is absent). On a validation/resolve failure the previously applied
     /// configuration is left unchanged and an error is returned.
+    ///
+    /// # Errors
+    /// Returns an error on validation, certificate loading, or a poisoned state lock.
     pub fn reload_subscription_settings(
         &self,
         sub: Option<crate::subscription::SubscriptionSettings>,
@@ -262,14 +323,19 @@ impl Core {
         let resolved = match sub {
             Some(sub) => Some(
                 crate::subscription::resolve(&sub, &self.context.settings, hosts).map_err(|e| {
-                    io::Error::other(format!("Subscription resolve failure: {:?}", e))
+                    io::Error::other(format!("Subscription resolve failure: {e:?}"))
                 })?,
             ),
             None => None,
         };
 
-        let mut store = self.context.subscription.write().unwrap();
+        let mut store = self
+            .context
+            .subscription
+            .write()
+            .map_err(|error| io::Error::other(error.to_string()))?;
         *store = resolved;
+        drop(store);
         Ok(())
     }
 
@@ -342,7 +408,7 @@ impl Core {
                                 client_id,
                                 "TLS handshake complete, processing connection"
                             );
-                            if let Err((client_id, message)) = Core::on_new_tls_connection(
+                            if let Err((client_id, message)) = Self::on_new_tls_connection(
                                 context.clone(),
                                 acceptor,
                                 net_utils::unmap_ipv6(client_addr.ip()),
@@ -413,72 +479,59 @@ impl Core {
         forwarder.listen().await
     }
 
+    fn select_tls_connection_meta(
+        context: &Context,
+        acceptor: &TlsAcceptor,
+        peer_ip: std::net::IpAddr,
+        client_id: &log_utils::IdChain<u64>,
+    ) -> Result<tls_demultiplexer::ConnectionMeta, String> {
+        let sni = acceptor
+            .sni()
+            .ok_or_else(|| "Drop TLS connection due to absence of SNI".to_owned())?;
+        log_id!(
+            trace,
+            client_id,
+            "TLS SNI: {}",
+            net_utils::scrub_sni(sni.clone())
+        );
+        // Apply connection filtering rules
+        Self::evaluate_connection_rules(
+            context,
+            Some(peer_ip),
+            acceptor.client_random().as_deref(),
+            Some(sni.as_str()),
+            client_id,
+        )?;
+        let meta = context
+            .tls_demux
+            .read()
+            .map_err(|error| error.to_string())?
+            .select(acceptor.alpn().iter().map(Vec::as_slice), sni)
+            .map_err(|error| format!("Dropping connection due to error: {error}"))?;
+        if meta.protocol == tls_demultiplexer::Protocol::Http3 {
+            return Err(format!(
+                "Dropping connection due to unexpected protocol: {meta:?}"
+            ));
+        }
+        log_id!(debug, client_id, "Connection meta: {:?}", meta);
+        Ok(meta)
+    }
+
     async fn on_new_tls_connection(
         context: Arc<Context>,
         acceptor: TlsAcceptor,
-        client_ip: std::net::IpAddr,
+        peer_ip: std::net::IpAddr,
         client_id: log_utils::IdChain<u64>,
     ) -> Result<(), (log_utils::IdChain<u64>, String)> {
         log_id!(
             trace,
             client_id,
             "Processing TLS connection from {}",
-            client_ip
+            peer_ip
         );
-        let sni = match acceptor.sni() {
-            Some(s) => s,
-            None => {
-                return Err((
-                    client_id,
-                    "Drop TLS connection due to absence of SNI".to_string(),
-                ))
-            }
-        };
-        log_id!(
-            trace,
-            client_id,
-            "TLS SNI: {}",
-            net_utils::scrub_sni(sni.to_string())
-        );
-        // Apply connection filtering rules
-        if let Err(deny_reason) = Self::evaluate_connection_rules(
-            &context,
-            Some(client_ip),
-            acceptor.client_random().as_deref(),
-            Some(sni.as_str()),
-            &client_id,
-        ) {
-            return Err((client_id, deny_reason));
-        }
-
-        let core_settings = context.settings.clone();
-        let tls_connection_meta = match context
-            .tls_demux
-            .read()
-            .unwrap()
-            .select(acceptor.alpn().iter().map(Vec::as_slice), sni)
-        {
-            Ok(x) if x.protocol == tls_demultiplexer::Protocol::Http3 => {
-                return Err((
-                    client_id,
-                    format!("Dropping connection due to unexpected protocol: {:?}", x),
-                ))
-            }
-            Ok(x) => x,
-            Err(e) => {
-                return Err((
-                    client_id,
-                    format!("Dropping connection due to error: {}", e),
-                ))
-            }
-        };
-        log_id!(
-            debug,
-            client_id,
-            "Connection meta: {:?}",
-            tls_connection_meta
-        );
-
+        let tls_connection_meta =
+            Self::select_tls_connection_meta(&context, &acceptor, peer_ip, &client_id)
+                .map_err(|error| (client_id.clone(), error))?;
         log_id!(
             trace,
             client_id,
@@ -496,123 +549,110 @@ impl Core {
         )
         .await
         {
-            Ok(Ok(s)) => {
-                log_id!(debug, client_id, "New TLS client: {:?}", s);
-                s
+            Ok(Ok(stream)) => {
+                log_id!(debug, client_id, "New TLS client: {:?}", stream);
+                stream
             }
-            Ok(Err(e)) => {
-                return Err((client_id, format!("TLS connection failed: {}", e)));
-            }
+            Ok(Err(error)) => return Err((client_id, format!("TLS connection failed: {error}"))),
             Err(_) => {
                 return Err((
                     client_id,
-                    "TLS connection failed: handshake timed out".to_string(),
-                ));
+                    "TLS connection failed: handshake timed out".to_owned(),
+                ))
             }
         };
-
         log_id!(
             trace,
             client_id,
             "Routing to channel: {:?}",
             tls_connection_meta.channel
         );
-        match tls_connection_meta.channel {
+        let is_tunnel = tls_connection_meta.channel == net_utils::Channel::Tunnel;
+        let codec_id = if is_tunnel {
+            let tunnel_id = client_id.extended(log_utils::IdItem::new(
+                log_utils::TUNNEL_ID_FMT,
+                context.next_tunnel_id.fetch_add(1, Ordering::Relaxed),
+            ));
+            log_id!(trace, tunnel_id, "Creating tunnel");
+            context
+                .metrics
+                .register_connection(tunnel_id.to_string(), Some(peer_ip));
+            tunnel_id
+        } else {
+            client_id.clone()
+        };
+        let codec = match Self::make_tcp_http_codec(
+            tls_connection_meta.protocol,
+            &context.settings,
+            stream,
+            codec_id.clone(),
+        ) {
+            Ok(codec) => codec,
+            Err(error) => {
+                if is_tunnel {
+                    context.metrics.unregister_connection(&codec_id.to_string());
+                }
+                return Err((client_id, format!("Failed to create HTTP codec: {error}")));
+            }
+        };
+        Self::route_tls_connection(
+            context,
+            codec,
+            tls_connection_meta.channel,
+            tls_connection_meta.protocol,
+            tls_connection_meta.sni,
+            tls_connection_meta.sni_auth_creds,
+            codec_id,
+        )
+        .await
+    }
+
+    async fn route_tls_connection(
+        context: Arc<Context>,
+        codec: Box<dyn HttpCodec>,
+        channel: net_utils::Channel,
+        protocol: tls_demultiplexer::Protocol,
+        sni: String,
+        sni_auth_creds: Option<String>,
+        client_id: log_utils::IdChain<u64>,
+    ) -> Result<(), (log_utils::IdChain<u64>, String)> {
+        match channel {
             net_utils::Channel::Tunnel => {
-                let tunnel_id = client_id.extended(log_utils::IdItem::new(
-                    log_utils::TUNNEL_ID_FMT,
-                    context.next_tunnel_id.fetch_add(1, Ordering::Relaxed),
-                ));
-                log_id!(trace, tunnel_id, "Creating tunnel");
-                let conn_key = tunnel_id.to_string();
-                context
-                    .metrics
-                    .register_connection(conn_key.clone(), Some(client_ip));
-                Self::on_tunnel_request(
-                    context.clone(),
-                    tls_connection_meta.protocol,
-                    match Self::make_tcp_http_codec(
-                        tls_connection_meta.protocol,
-                        core_settings,
-                        stream,
-                        tunnel_id.clone(),
-                    ) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            context.metrics.unregister_connection(&conn_key);
-                            return Err((client_id, format!("Failed to create HTTP codec: {}", e)));
-                        }
-                    },
-                    tls_connection_meta.sni,
-                    tls_connection_meta.sni_auth_creds,
-                    tunnel_id,
-                )
-                .await
+                Self::on_tunnel_request(context, protocol, codec, sni, sni_auth_creds, client_id)
+                    .await;
             }
             net_utils::Channel::Ping => {
                 http_ping_handler::listen(
-                    context.shutdown.clone(),
-                    match Self::make_tcp_http_codec(
-                        tls_connection_meta.protocol,
-                        core_settings,
-                        stream,
-                        client_id.clone(),
-                    ) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            return Err((client_id, format!("Failed to create HTTP codec: {}", e)))
-                        }
-                    },
+                    Arc::clone(&context.shutdown),
+                    codec,
                     context.settings.tls_handshake_timeout,
                     client_id,
                 )
-                .await
+                .await;
             }
             net_utils::Channel::Speedtest => {
                 http_speedtest_handler::listen(
-                    context.shutdown.clone(),
-                    match Self::make_tcp_http_codec(
-                        tls_connection_meta.protocol,
-                        core_settings,
-                        stream,
-                        client_id.clone(),
-                    ) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            return Err((client_id, format!("Failed to create HTTP codec: {}", e)))
-                        }
-                    },
+                    Arc::clone(&context.shutdown),
+                    codec,
                     context.settings.tls_handshake_timeout,
                     context.settings.speedtest_path.clone(),
                     client_id,
                 )
-                .await
+                .await;
             }
             net_utils::Channel::ReverseProxy => {
-                reverse_proxy::listen(
-                    context.clone(),
-                    match Self::make_tcp_http_codec(
-                        tls_connection_meta.protocol,
-                        core_settings,
-                        stream,
-                        client_id.clone(),
-                    ) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            return Err((client_id, format!("Failed to create HTTP codec: {}", e)))
-                        }
-                    },
-                    tls_connection_meta.sni,
-                    client_id,
-                )
-                .await
+                reverse_proxy::listen(context, codec, sni, client_id).await;
             }
             // TLS-level routing is SNI-based and subscription is
             // never matched by hostname, only by request path via `HttpDemux`
             // in `HttpDownstream`.
-            net_utils::Channel::Subscription => unreachable!(),
+            net_utils::Channel::Subscription => {
+                return Err((
+                    client_id,
+                    "Unexpected subscription channel selected by TLS routing".to_owned(),
+                ))
+            }
         }
-
         Ok(())
     }
 
@@ -622,7 +662,7 @@ impl Core {
         client_id: log_utils::IdChain<u64>,
     ) {
         // Apply connection filtering rules
-        let client_ip = socket
+        let peer_ip = socket
             .peer_addr()
             .ok()
             .map(|addr| net_utils::unmap_ipv6(addr.ip()));
@@ -631,7 +671,7 @@ impl Core {
 
         if let Err(deny_reason) = Self::evaluate_connection_rules(
             &context,
-            client_ip,
+            peer_ip,
             client_random.as_deref(),
             Some(tls_connection_meta.sni.as_str()),
             &client_id,
@@ -657,7 +697,7 @@ impl Core {
                 let sni = tls_connection_meta.sni.clone();
                 let sni_auth_creds = tls_connection_meta.sni_auth_creds.clone();
                 let conn_key = tunnel_id.to_string();
-                context.metrics.register_connection(conn_key, client_ip);
+                context.metrics.register_connection(conn_key, peer_ip);
                 Self::on_tunnel_request(
                     context,
                     tls_connection_meta.protocol,
@@ -666,7 +706,7 @@ impl Core {
                     sni_auth_creds,
                     tunnel_id,
                 )
-                .await
+                .await;
             }
             net_utils::Channel::Ping => {
                 http_ping_handler::listen(
@@ -675,7 +715,7 @@ impl Core {
                     context.settings.tls_handshake_timeout,
                     client_id,
                 )
-                .await
+                .await;
             }
             net_utils::Channel::Speedtest => {
                 http_speedtest_handler::listen(
@@ -685,7 +725,7 @@ impl Core {
                     context.settings.speedtest_path.clone(),
                     client_id,
                 )
-                .await
+                .await;
             }
             net_utils::Channel::ReverseProxy => {
                 let sni = tls_connection_meta.sni.clone();
@@ -696,25 +736,31 @@ impl Core {
                     sni,
                     client_id,
                 )
-                .await
+                .await;
             }
             // TLS-level routing is SNI-based and subscription is
             // never matched by hostname, only by request path via `HttpDemux`
             // in `HttpDownstream`.
-            net_utils::Channel::Subscription => unreachable!(),
+            net_utils::Channel::Subscription => {
+                log_id!(
+                    warn,
+                    client_id,
+                    "Unexpected subscription channel selected by TLS routing"
+                );
+            }
         }
     }
 
     /// Helper function to evaluate connection filtering rules
     fn evaluate_connection_rules(
-        context: &Arc<Context>,
-        client_ip: Option<std::net::IpAddr>,
+        context: &Context,
+        peer_ip: Option<std::net::IpAddr>,
         client_random: Option<&[u8]>,
         sni: Option<&str>,
         log_id: &log_utils::IdChain<u64>,
     ) -> Result<(), String> {
         if let Some(rules_engine) = &context.settings.rules_engine {
-            if let Some(ip) = client_ip {
+            if let Some(ip) = peer_ip {
                 let rule_result = rules_engine.evaluate(&ip, client_random, sni);
                 match rule_result {
                     rules::RuleEvaluation::Deny => {
@@ -773,8 +819,8 @@ impl Core {
                         authentication::Status::Pass => {
                             let guard = context.connection_limiter.as_ref().and_then(|limiter| {
                                 let creds = match &auth {
-                                    authentication::Source::Sni(s) => s.as_ref(),
-                                    authentication::Source::ProxyBasic(s) => s.as_ref(),
+                                    authentication::Source::Sni(s)
+                                    | authentication::Source::ProxyBasic(s) => s.as_ref(),
                                 };
                                 limiter.try_acquire(creds, protocol)
                             });
@@ -808,14 +854,14 @@ impl Core {
 
         log_id!(trace, tunnel_id, "Listening for client tunnel");
         match tunnel.listen().await {
-            Ok(_) => log_id!(debug, tunnel_id, "Tunnel stopped gracefully"),
+            Ok(()) => log_id!(debug, tunnel_id, "Tunnel stopped gracefully"),
             Err(e) => log_id!(debug, tunnel_id, "Tunnel stopped with error: {}", e),
         }
     }
 
     fn make_tcp_http_codec<IO>(
         protocol: tls_demultiplexer::Protocol,
-        core_settings: Arc<Settings>,
+        core_settings: &Settings,
         io: IO,
         log_id: log_utils::IdChain<u64>,
     ) -> io::Result<Box<dyn HttpCodec>>
@@ -824,12 +870,15 @@ impl Core {
     {
         match protocol {
             tls_demultiplexer::Protocol::Http1 => {
-                Ok(Box::new(Http1Codec::new(core_settings, io, log_id)))
+                Ok(Box::new(Http1Codec::new(core_settings, io, log_id)?))
             }
             tls_demultiplexer::Protocol::Http2 => {
                 Ok(Box::new(Http2Codec::new(core_settings, io, log_id)?))
             }
-            tls_demultiplexer::Protocol::Http3 => unreachable!(),
+            tls_demultiplexer::Protocol::Http3 => Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "HTTP/3 is not a TCP codec",
+            )),
         }
     }
 
@@ -842,24 +891,60 @@ impl Core {
 }
 
 #[cfg(test)]
-impl Default for Context {
-    fn default() -> Self {
+impl Context {
+    pub(crate) fn test() -> io::Result<Self> {
         let settings = Arc::new(Settings::default());
         let (fatal_error, _fatal_error_rx) = watch::channel(None);
-        Self {
-            settings: settings.clone(),
+        Ok(Self {
+            settings: Arc::clone(&settings),
             authenticator: None,
             subscription: Arc::new(std::sync::RwLock::new(None)),
-            tls_demux: Arc::new(RwLock::new(
-                TlsDemux::new(&settings, &settings::TlsHostsSettings::default()).unwrap(),
-            )),
+            tls_demux: Arc::new(RwLock::new(TlsDemux::new(
+                &settings,
+                &settings::TlsHostsSettings::default(),
+            )?)),
             icmp_forwarder: None,
             shutdown: Shutdown::new(),
             fatal_error,
-            metrics: Metrics::new(false).unwrap(),
-            next_client_id: Default::default(),
-            next_tunnel_id: Default::default(),
+            metrics: Metrics::new(false)?,
+            next_client_id: Arc::default(),
+            next_tunnel_id: Arc::default(),
             connection_limiter: None,
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn initialization_error_preserves_validation_source() {
+        let error = Error::SettingsValidation(settings::ValidationError::ListenAddressNotSet);
+        assert!(matches!(
+            error.source().and_then(|source| source.downcast_ref()),
+            Some(settings::ValidationError::ListenAddressNotSet)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Settings validation failed: Listen address is not set"
+        );
+    }
+
+    #[test]
+    fn initialization_error_formats_message_only_failures() {
+        let tls = Error::TlsDemultiplexer("invalid identity".to_owned());
+        assert!(tls.source().is_none());
+        assert_eq!(
+            tls.to_string(),
+            "TLS demultiplexer initialization failed: invalid identity"
+        );
+        let metrics = Error::Metrics("registration failed".to_owned());
+        assert!(metrics.source().is_none());
+        assert_eq!(
+            metrics.to_string(),
+            "Metrics initialization failed: registration failed"
+        );
     }
 }

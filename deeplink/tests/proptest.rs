@@ -1,3 +1,5 @@
+//! Property-based coverage of deep-link and variable-length integer roundtrips.
+
 use proptest::prelude::*;
 use trusttunnel_deeplink::{decode, encode, DeepLinkConfig, Protocol};
 
@@ -105,13 +107,14 @@ fn arbitrary_config() -> impl Strategy<Value = DeepLinkConfig> {
 proptest! {
     #[test]
     fn test_encode_decode_roundtrip(config in arbitrary_config()) {
-        let uri = encode(&config).unwrap();
-        let decoded = decode(&uri).unwrap();
+        let uri = encode(&config)?;
+        let decoded = decode(&uri)?;
 
         prop_assert_eq!(decoded.hostname, config.hostname);
         prop_assert_eq!(decoded.addresses, config.addresses);
         prop_assert_eq!(decoded.username, config.username);
         prop_assert_eq!(decoded.password, config.password);
+        prop_assert_eq!(decoded.client_random_prefix, config.client_random_prefix);
         prop_assert_eq!(decoded.client_random_auth_key, config.client_random_auth_key);
         prop_assert_eq!(decoded.custom_sni, config.custom_sni);
         prop_assert_eq!(decoded.has_ipv6, config.has_ipv6);
@@ -126,22 +129,22 @@ proptest! {
 
     #[test]
     fn test_uri_starts_with_scheme(config in arbitrary_config()) {
-        let uri = encode(&config).unwrap();
+        let uri = encode(&config)?;
         prop_assert!(uri.starts_with("tt://?"));
     }
 
     #[test]
     fn test_uri_no_padding(config in arbitrary_config()) {
-        let uri = encode(&config).unwrap();
+        let uri = encode(&config)?;
         prop_assert!(!uri.contains('='));
     }
 
     #[test]
-    fn test_varint_roundtrip(value in 0u64..0x3FFFFFFFFFFFFFFF) {
+    fn test_varint_roundtrip(value in 0u64..0x3FFF_FFFF_FFFF_FFFF) {
         use trusttunnel_deeplink::varint::{encode_varint, decode_varint};
 
-        let encoded = encode_varint(value).unwrap();
-        let (decoded, _) = decode_varint(&encoded, 0).unwrap();
+        let encoded = encode_varint(value)?;
+        let (decoded, _) = decode_varint(&encoded, 0)?;
         prop_assert_eq!(decoded, value);
     }
 }

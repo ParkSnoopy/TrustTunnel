@@ -1,7 +1,12 @@
 [package]
 name = "macros"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+description = "Derive macros for TrustTunnel getters and runtime documentation"
+license.workspace = true
+repository.workspace = true
+keywords = ["derive", "macros", "documentation"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

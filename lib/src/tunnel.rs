@@ -22,11 +22,11 @@ fn decode_username(creds: &str) -> Option<String> {
         .decode(creds)
         .ok()
         .and_then(|v| String::from_utf8(v).ok())
-        .and_then(|s| s.split(':').next().map(|x| x.to_string()))
+        .and_then(|s| s.split(':').next().map(ToString::to_string))
 }
 
 #[derive(Clone)]
-pub(crate) enum AuthenticationPolicy<'this> {
+pub enum AuthenticationPolicy<'this> {
     /// Perform the regular authentication procedure through the configured authenticator
     Default,
     /// The whole connection is authenticated.
@@ -34,7 +34,7 @@ pub(crate) enum AuthenticationPolicy<'this> {
     Authenticated(authentication::Source<'this>),
 }
 
-pub(crate) struct Tunnel {
+pub struct Tunnel {
     context: Arc<core::Context>,
     downstream: Box<dyn Downstream>,
     forwarder: Arc<Mutex<Box<dyn Forwarder>>>,
@@ -47,7 +47,7 @@ pub(crate) struct Tunnel {
 }
 
 #[derive(Debug)]
-pub(crate) enum ConnectionError {
+pub enum ConnectionError {
     Io(io::Error),
     Authentication(String),
     Timeout,
@@ -57,16 +57,18 @@ pub(crate) enum ConnectionError {
     Other(String),
 }
 
+type RequestFailure<R> = (Option<Box<R>>, &'static str, ConnectionError);
+
 impl Display for ConnectionError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(x) => write!(f, "IO error: {}", x),
-            Self::Authentication(x) => write!(f, "Authentication error: {}", x),
+            Self::Io(x) => write!(f, "IO error: {x}"),
+            Self::Authentication(x) => write!(f, "Authentication error: {x}"),
             Self::Timeout => write!(f, "Connection timed out"),
             Self::HostUnreachable => write!(f, "Remote host is unreachable"),
             Self::DnsNonroutable => write!(f, "DNS: resolved address in non-routable network"),
             Self::DnsLoopback => write!(f, "DNS: resolved address in loopback"),
-            Self::Other(x) => write!(f, "{}", x),
+            Self::Other(x) => write!(f, "{x}"),
         }
     }
 }
@@ -92,14 +94,17 @@ impl Tunnel {
 
     pub async fn listen(&mut self) -> io::Result<()> {
         let (mut shutdown_notification, _shutdown_completion) = {
-            let shutdown = self.context.shutdown.lock().unwrap();
+            let shutdown = self.context.shutdown.lock().unwrap_or_else(|e| {
+                log_id!(error, self.id, "Recovering poisoned shutdown lock: {}", e);
+                e.into_inner()
+            });
             (shutdown.notification_handler(), shutdown.completion_guard())
         };
         tokio::select! {
             x = shutdown_notification.wait() => {
                 match x {
-                    Ok(_) => self.downstream.graceful_shutdown().await,
-                    Err(e) => Err(io::Error::other(format!("{}", e))),
+                    Ok(()) => self.downstream.graceful_shutdown().await,
+                    Err(e) => Err(io::Error::other(format!("{e}"))),
                 }
             }
             x = self.listen_inner() => x,
@@ -116,8 +121,9 @@ impl Tunnel {
             }
             AuthenticationPolicy::Default => match request.auth_info() {
                 Ok(Some(source)) => match &source {
-                    authentication::Source::ProxyBasic(s) => decode_username(s.as_ref()),
-                    authentication::Source::Sni(s) => decode_username(s.as_ref()),
+                    authentication::Source::ProxyBasic(s) | authentication::Source::Sni(s) => {
+                        decode_username(s.as_ref())
+                    }
                 },
                 _ => None,
             },
@@ -155,201 +161,249 @@ impl Tunnel {
                 }
             };
 
-            let context = self.context.clone();
-            let forwarder = self.forwarder.clone();
-            let tls_domain = self.downstream.tls_domain().to_string();
-            let authentication_policy = self.authentication_policy.clone();
-            let log_id = self.id.clone();
-            let protocol = self.downstream.protocol();
-            let username = if context.metrics.per_client() {
-                self.resolve_username(request.as_ref())
-            } else {
-                None
-            };
-            let update_metrics = {
-                let metrics = context.metrics.clone();
-                move |direction, n| match direction {
-                    pipe::SimplexDirection::Incoming => {
-                        metrics.add_inbound_bytes(protocol, username.as_deref(), n)
-                    }
-                    pipe::SimplexDirection::Outgoing => {
-                        metrics.add_outbound_bytes(protocol, username.as_deref(), n)
-                    }
+            self.spawn_request(request)?;
+        }
+    }
+
+    fn spawn_request(
+        &mut self,
+        request: Box<dyn downstream::PendingMultiplexedRequest>,
+    ) -> io::Result<()> {
+        let context = self.context.clone();
+        let forwarder = self.forwarder.clone();
+        let tls_domain = self.downstream.tls_domain().to_string();
+        let authentication_policy = self.authentication_policy.clone();
+        let log_id = self.id.clone();
+        let protocol = self.downstream.protocol();
+        let username = if context.metrics.per_client() {
+            self.resolve_username(request.as_ref())
+        } else {
+            None
+        };
+        let update_metrics = {
+            let metrics = context.metrics.clone();
+            move |direction, n| match direction {
+                pipe::SimplexDirection::Incoming => {
+                    metrics.add_inbound_bytes(protocol, username.as_deref(), n);
+                }
+                pipe::SimplexDirection::Outgoing => {
+                    metrics.add_outbound_bytes(protocol, username.as_deref(), n);
+                }
+            }
+        };
+
+        if let Err(e) = self.acquire_connection_guard(request.as_ref()) {
+            request.fail_request(ConnectionError::Authentication(
+                "Connection limit exceeded".to_string(),
+            ));
+            return Err(e);
+        }
+
+        tokio::spawn(async move {
+            let request_id = request.id();
+            log_id!(trace, request_id, "Processing tunnel request");
+            let auth_info_result = request
+                .auth_info()
+                .map(|x| x.map(authentication::Source::into_owned));
+            let forwarder_auth = match Self::authenticate_request(
+                auth_info_result.as_ref().cloned(),
+                authentication_policy,
+                &context,
+                &log_id,
+                &request_id,
+            ) {
+                Ok(auth) => auth,
+                Err(err) => {
+                    request.fail_request(err);
+                    return;
                 }
             };
 
-            // For proxy-basic connections, lazily acquire the connection slot on the first
-            // authenticated request. This means the limit applies to active tunnels that have
-            // sent at least one request, not to idle connections. This is done before spawning
-            // so the guard lifetime matches the tunnel, not an individual request task.
-            if self.connection_guard.is_none() {
-                if let Some(limiter) = self.context.connection_limiter.as_ref() {
-                    let auth_info = request
-                        .auth_info()
-                        .map(|x| x.map(authentication::Source::into_owned));
-                    let protocol = self.downstream.protocol();
-                    if let Ok(Some(source)) = auth_info {
-                        let authenticated = self
-                            .context
-                            .authenticator
-                            .as_ref()
-                            .map(|a| a.authenticate(&source, &self.id) == Status::Pass)
-                            .unwrap_or(false);
-                        if authenticated {
-                            let creds = match &source {
-                                authentication::Source::ProxyBasic(s) => s.as_ref(),
-                                authentication::Source::Sni(s) => s.as_ref(),
-                            };
-                            match limiter.try_acquire(creds, protocol) {
-                                Some(guard) => {
-                                    self.connection_guard = Some(guard);
-                                }
-                                None => {
-                                    log_id!(
-                                        debug,
-                                        self.id,
-                                        "Connection limit exceeded, closing tunnel"
-                                    );
-                                    request.fail_request(ConnectionError::Authentication(
-                                        "Connection limit exceeded".to_string(),
-                                    ));
-                                    return Err(io::Error::new(
-                                        ErrorKind::PermissionDenied,
-                                        "Connection limit exceeded",
-                                    ));
-                                }
-                            }
+            log_id!(
+                trace,
+                request_id,
+                "Authentication complete, promoting request"
+            );
+
+            // If this request carried credentials, relabel the session
+            // with the authenticated username (no-op if it's already labelled).
+            if let Ok(Some(source)) = auth_info_result {
+                let username_opt = match &source {
+                    authentication::Source::ProxyBasic(s) | authentication::Source::Sni(s) => {
+                        decode_username(s.as_ref())
+                    }
+                };
+                if let Some(u) = username_opt {
+                    context.metrics.transfer_session_username(
+                        protocol,
+                        &log_id.to_string(),
+                        Some(u),
+                    );
+                }
+            }
+            Self::forward_request(
+                context,
+                forwarder,
+                request,
+                forwarder_auth,
+                tls_domain,
+                update_metrics,
+                request_id,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
+    async fn forward_request<F: Fn(pipe::SimplexDirection, usize) + Send + Clone + Sync>(
+        context: Arc<core::Context>,
+        forwarder: Arc<Mutex<Box<dyn Forwarder>>>,
+        request: Box<dyn downstream::PendingMultiplexedRequest>,
+        forwarder_auth: Option<authentication::Source<'static>>,
+        tls_domain: String,
+        update_metrics: F,
+        request_id: log_utils::IdChain<u64>,
+    ) {
+        match request.promote_to_next_state() {
+            Ok(None) => {
+                log_id!(trace, request_id, "Health check request completed");
+            }
+            Ok(Some(PendingDemultiplexedRequest::TcpConnect(request))) => {
+                log_id!(trace, request_id, "Handling TCP connect request");
+                if let Err((request, message, e)) = Self::on_tcp_connect_request(
+                    context.clone(),
+                    forwarder,
+                    request,
+                    forwarder_auth,
+                    tls_domain,
+                    update_metrics,
+                )
+                .await
+                {
+                    Self::report_fatal_if_too_many_open_files(&context, &e);
+                    log_id!(debug, request_id, "{}: {}", message, e);
+                    if let Some(request) = request {
+                        request.fail_request(e);
+                    }
+                }
+            }
+            Ok(Some(PendingDemultiplexedRequest::DatagramMultiplexer(request))) => {
+                log_id!(trace, request_id, "Handling datagram multiplexer request");
+                if let Err((request, message, e)) = Self::on_datagram_mux_request(
+                    context.clone(),
+                    forwarder,
+                    request,
+                    forwarder_auth,
+                    tls_domain,
+                    update_metrics,
+                )
+                .await
+                {
+                    Self::report_fatal_if_too_many_open_files(&context, &e);
+                    log_id!(debug, request_id, "{}: {}", message, e);
+                    if let Some(request) = request {
+                        request.fail_request(e);
+                    }
+                }
+            }
+            Err(e) => {
+                log_id!(debug, request_id, "Failed to complete request: {}", e);
+            }
+        }
+    }
+
+    fn acquire_connection_guard(
+        &mut self,
+        request: &dyn downstream::PendingMultiplexedRequest,
+    ) -> io::Result<()> {
+        // For proxy-basic connections, lazily acquire the connection slot on the first
+        // authenticated request. This means the limit applies to active tunnels that have
+        // sent at least one request, not to idle connections. This is done before spawning
+        // so the guard lifetime matches the tunnel, not an individual request task.
+        if self.connection_guard.is_none() {
+            if let Some(limiter) = self.context.connection_limiter.as_ref() {
+                let auth_info = request
+                    .auth_info()
+                    .map(|x| x.map(authentication::Source::into_owned));
+                let protocol = self.downstream.protocol();
+                if let Ok(Some(source)) = auth_info {
+                    let authenticated = self
+                        .context
+                        .authenticator
+                        .as_ref()
+                        .is_some_and(|a| a.authenticate(&source, &self.id) == Status::Pass);
+                    if authenticated {
+                        let creds = match &source {
+                            authentication::Source::ProxyBasic(s)
+                            | authentication::Source::Sni(s) => s.as_ref(),
+                        };
+                        if let Some(guard) = limiter.try_acquire(creds, protocol) {
+                            self.connection_guard = Some(guard);
+                        } else {
+                            log_id!(debug, self.id, "Connection limit exceeded, closing tunnel");
+                            return Err(io::Error::new(
+                                ErrorKind::PermissionDenied,
+                                "Connection limit exceeded",
+                            ));
                         }
                     }
                 }
             }
+        }
+        Ok(())
+    }
 
-            tokio::spawn(async move {
-                fn report_fatal_if_too_many_open_files(
-                    context: &Arc<core::Context>,
-                    e: &ConnectionError,
-                ) {
-                    if let ConnectionError::Io(io) = e {
-                        if core::Core::is_too_many_open_files_error(io) {
-                            context.report_fatal_io_error(io);
+    fn authenticate_request(
+        auth_info_result: Result<Option<authentication::Source<'static>>, &io::Error>,
+        authentication_policy: AuthenticationPolicy<'static>,
+        context: &core::Context,
+        log_id: &log_utils::IdChain<u64>,
+        request_id: &log_utils::IdChain<u64>,
+    ) -> Result<Option<authentication::Source<'static>>, ConnectionError> {
+        Ok(
+            match (
+                auth_info_result,
+                authentication_policy,
+                context.authenticator.clone(),
+            ) {
+                (Ok(Some(source)), _, Some(authenticator)) => {
+                    match authenticator.authenticate(&source, log_id) {
+                        Status::Pass => Some(source),
+                        Status::Reject => {
+                            let err = ConnectionError::Authentication(
+                                "Authentication failed".to_string(),
+                            );
+                            log_id!(debug, request_id, "{}", err);
+                            return Err(err);
                         }
                     }
                 }
-
-                let request_id = request.id();
-                log_id!(trace, request_id, "Processing tunnel request");
-                let auth_info_result = request
-                    .auth_info()
-                    .map(|x| x.map(authentication::Source::into_owned));
-                let forwarder_auth = match (
-                    auth_info_result.as_ref().cloned(),
-                    authentication_policy,
-                    context.authenticator.clone(),
-                ) {
-                    (Ok(Some(source)), _, Some(authenticator)) => {
-                        match authenticator.authenticate(&source, &log_id) {
-                            Status::Pass => Some(source),
-                            Status::Reject => {
-                                let err = ConnectionError::Authentication(
-                                    "Authentication failed".to_string(),
-                                );
-                                log_id!(debug, request_id, "{}", err);
-                                request.fail_request(err);
-                                return;
-                            }
-                        }
-                    }
-                    (Ok(None), AuthenticationPolicy::Authenticated(x), Some(_)) => Some(x),
-                    (Ok(x), policy, None) => x.or(match policy {
-                        AuthenticationPolicy::Default => None,
-                        AuthenticationPolicy::Authenticated(y) => Some(y),
-                    }),
-                    (Ok(None), AuthenticationPolicy::Default, Some(_)) => {
-                        let err = ConnectionError::Authentication(
-                            "Got request without authentication info on non-authenticated connection".to_string()
-                        );
-                        log_id!(debug, request_id, "{}", err);
-                        request.fail_request(err);
-                        return;
-                    }
-                    (Err(e), ..) => {
-                        log_id!(debug, request_id, "Failed to get auth info: {}", e);
-                        request.fail_request(ConnectionError::Io(io::Error::new(
-                            e.kind(),
-                            e.to_string(),
-                        )));
-                        return;
-                    }
-                };
-
-                log_id!(
-                    trace,
-                    request_id,
-                    "Authentication complete, promoting request"
-                );
-
-                // If this request carried credentials, relabel the session
-                // with the authenticated username (no-op if it's already labelled).
-                if let Ok(Some(source)) = auth_info_result {
-                    let username_opt = match &source {
-                        authentication::Source::ProxyBasic(s) => decode_username(s.as_ref()),
-                        authentication::Source::Sni(s) => decode_username(s.as_ref()),
-                    };
-                    if let Some(u) = username_opt {
-                        context.metrics.transfer_session_username(
-                            protocol,
-                            &log_id.to_string(),
-                            Some(u),
-                        );
-                    }
+                (Ok(None), AuthenticationPolicy::Authenticated(x), Some(_)) => Some(x),
+                (Ok(x), policy, None) => x.or(match policy {
+                    AuthenticationPolicy::Default => None,
+                    AuthenticationPolicy::Authenticated(y) => Some(y),
+                }),
+                (Ok(None), AuthenticationPolicy::Default, Some(_)) => {
+                    let err = ConnectionError::Authentication(
+                        "Got request without authentication info on non-authenticated connection"
+                            .to_string(),
+                    );
+                    log_id!(debug, request_id, "{}", err);
+                    return Err(err);
                 }
-                match request.promote_to_next_state() {
-                    Ok(None) => {
-                        log_id!(trace, request_id, "Health check request completed");
-                    }
-                    Ok(Some(PendingDemultiplexedRequest::TcpConnect(request))) => {
-                        log_id!(trace, request_id, "Handling TCP connect request");
-                        if let Err((request, message, e)) = Tunnel::on_tcp_connect_request(
-                            context.clone(),
-                            forwarder,
-                            request,
-                            forwarder_auth,
-                            tls_domain,
-                            update_metrics,
-                        )
-                        .await
-                        {
-                            report_fatal_if_too_many_open_files(&context, &e);
-                            log_id!(debug, request_id, "{}: {}", message, e);
-                            if let Some(request) = request {
-                                request.fail_request(e);
-                            }
-                        }
-                    }
-                    Ok(Some(PendingDemultiplexedRequest::DatagramMultiplexer(request))) => {
-                        log_id!(trace, request_id, "Handling datagram multiplexer request");
-                        if let Err((request, message, e)) = Tunnel::on_datagram_mux_request(
-                            context.clone(),
-                            forwarder,
-                            request,
-                            forwarder_auth,
-                            tls_domain,
-                            update_metrics,
-                        )
-                        .await
-                        {
-                            report_fatal_if_too_many_open_files(&context, &e);
-                            log_id!(debug, request_id, "{}: {}", message, e);
-                            if let Some(request) = request {
-                                request.fail_request(e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_id!(debug, request_id, "Failed to complete request: {}", e);
-                    }
+                (Err(e), ..) => {
+                    log_id!(debug, request_id, "Failed to get auth info: {}", e);
+                    return Err(ConnectionError::Io(io::Error::new(e.kind(), e.to_string())));
                 }
-            });
+            },
+        )
+    }
+
+    fn report_fatal_if_too_many_open_files(context: &Arc<core::Context>, e: &ConnectionError) {
+        if let ConnectionError::Io(io) = e {
+            if core::Core::is_too_many_open_files_error(io) {
+                context.report_fatal_io_error(io);
+            }
         }
     }
 
@@ -360,14 +414,7 @@ impl Tunnel {
         forwarder_auth: Option<authentication::Source<'static>>,
         tls_domain: String,
         update_metrics: F,
-    ) -> Result<
-        (),
-        (
-            Option<Box<dyn PendingTcpConnectRequest>>,
-            &'static str,
-            ConnectionError,
-        ),
-    > {
+    ) -> Result<(), RequestFailure<dyn PendingTcpConnectRequest>> {
         let request_id = request.id();
         log_id!(trace, request_id, "TCP connect: extracting destination");
         let destination = match request.destination() {
@@ -402,7 +449,13 @@ impl Tunnel {
         };
 
         log_id!(trace, request_id, "TCP connect: connecting to peer");
-        let connector = forwarder.lock().unwrap().tcp_connector();
+        let connector = forwarder
+            .lock()
+            .unwrap_or_else(|e| {
+                log::error!("Recovering poisoned forwarder lock: {e}");
+                e.into_inner()
+            })
+            .tcp_connector();
         let (fwd_rx, fwd_tx) = match tokio::time::timeout(
             context.settings.connection_establishment_timeout,
             connector.connect(request_id.clone(), meta.clone()),
@@ -450,7 +503,7 @@ impl Tunnel {
             .exchange(context.settings.tcp_connections_timeout)
             .await
         {
-            Ok(_) => {
+            Ok(()) => {
                 log_id!(trace, request_id, "TCP connect: pipe closed gracefully");
                 Ok(())
             }
@@ -461,24 +514,20 @@ impl Tunnel {
         }
     }
 
-    async fn on_datagram_mux_request<F: Fn(pipe::SimplexDirection, usize) + Send + Clone + Sync>(
-        context: Arc<core::Context>,
-        forwarder: Arc<Mutex<Box<dyn Forwarder>>>,
+    async fn prepare_datagram_mux_request(
+        forwarder: &Mutex<Box<dyn Forwarder>>,
         request: Box<dyn PendingDatagramMultiplexerRequest>,
-        forwarder_auth: Option<authentication::Source<'static>>,
+        auth: Option<authentication::Source<'static>>,
         tls_domain: String,
-        update_metrics: F,
     ) -> Result<
-        (),
         (
-            Option<Box<dyn PendingDatagramMultiplexerRequest>>,
-            &'static str,
-            ConnectionError,
+            Box<dyn PendingDatagramMultiplexerRequest>,
+            forwarder::UdpMultiplexerMeta,
         ),
+        RequestFailure<dyn PendingDatagramMultiplexerRequest>,
     > {
-        let request_id = request.id();
         let client_address = match request.client_address() {
-            Ok(x) => x,
+            Ok(address) => address,
             Err(e) => {
                 return Err((
                     Some(request),
@@ -489,14 +538,20 @@ impl Tunnel {
         };
         let user_agent = request.user_agent();
 
-        if let Some(auth) = &forwarder_auth {
-            let authenticator = forwarder.lock().unwrap().datagram_mux_authenticator();
+        if let Some(auth) = &auth {
+            let authenticator = forwarder
+                .lock()
+                .unwrap_or_else(|e| {
+                    log::error!("Recovering poisoned forwarder lock: {e}");
+                    e.into_inner()
+                })
+                .datagram_mux_authenticator();
             if let Err(e) = authenticator
                 .check_auth(
                     client_address,
                     &tls_domain,
                     auth.clone(),
-                    user_agent.as_ref().map(String::as_ref),
+                    user_agent.as_deref(),
                 )
                 .await
             {
@@ -504,26 +559,46 @@ impl Tunnel {
             }
         }
 
+        Ok((
+            request,
+            forwarder::UdpMultiplexerMeta {
+                client_address,
+                auth,
+                tls_domain,
+                user_agent,
+            },
+        ))
+    }
+
+    async fn on_datagram_mux_request<F: Fn(pipe::SimplexDirection, usize) + Send + Clone + Sync>(
+        context: Arc<core::Context>,
+        forwarder: Arc<Mutex<Box<dyn Forwarder>>>,
+        request: Box<dyn PendingDatagramMultiplexerRequest>,
+        forwarder_auth: Option<authentication::Source<'static>>,
+        tls_domain: String,
+        update_metrics: F,
+    ) -> Result<(), RequestFailure<dyn PendingDatagramMultiplexerRequest>> {
+        let request_id = request.id();
+        let (request, meta) =
+            Self::prepare_datagram_mux_request(&forwarder, request, forwarder_auth, tls_domain)
+                .await?;
+
         let mut pipe: Box<dyn datagram_pipe::DuplexPipe> = match request.promote_to_next_state() {
             Ok(downstream::DatagramPipeHalves::Udp(dstr_source, dstr_sink)) => {
-                let meta = forwarder::UdpMultiplexerMeta {
-                    client_address,
-                    auth: forwarder_auth,
-                    tls_domain,
-                    user_agent,
-                };
-                let (fwd_shared, fwd_source, fwd_sink) = match forwarder
-                    .lock()
-                    .unwrap()
-                    .make_udp_datagram_multiplexer(request_id.clone(), meta)
-                {
-                    Ok(x) => x,
-                    Err(e) => {
-                        return Err((
-                            None,
-                            "Failed to create datagram multiplexer",
-                            ConnectionError::Io(e),
-                        ))
+                let (fwd_shared, fwd_source, fwd_sink) = {
+                    let forwarder = forwarder.lock().unwrap_or_else(|e| {
+                        log::error!("Recovering poisoned forwarder lock: {e}");
+                        e.into_inner()
+                    });
+                    match forwarder.make_udp_datagram_multiplexer(request_id.clone(), meta) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            return Err((
+                                None,
+                                "Failed to create datagram multiplexer",
+                                ConnectionError::Io(e),
+                            ))
+                        }
                     }
                 };
 
@@ -535,25 +610,27 @@ impl Tunnel {
                 ))
             }
             Ok(downstream::DatagramPipeHalves::Icmp(dstr_source, dstr_sink)) => {
-                let (fwd_source, fwd_sink) = match forwarder
-                    .lock()
-                    .unwrap()
-                    .make_icmp_datagram_multiplexer(request_id.clone())
-                {
-                    Ok(Some(x)) => x,
-                    Ok(None) => {
-                        return Err((
-                            None,
-                            "ICMP forwarding isn't set up",
-                            ConnectionError::Other("Not allowed".to_string()),
-                        ))
-                    }
-                    Err(e) => {
-                        return Err((
-                            None,
-                            "Failed to create datagram multiplexer",
-                            ConnectionError::Io(e),
-                        ))
+                let (fwd_source, fwd_sink) = {
+                    let forwarder = forwarder.lock().unwrap_or_else(|e| {
+                        log::error!("Recovering poisoned forwarder lock: {e}");
+                        e.into_inner()
+                    });
+                    match forwarder.make_icmp_datagram_multiplexer(request_id.clone()) {
+                        Ok(Some(x)) => x,
+                        Ok(None) => {
+                            return Err((
+                                None,
+                                "ICMP forwarding isn't set up",
+                                ConnectionError::Other("Not allowed".to_string()),
+                            ))
+                        }
+                        Err(e) => {
+                            return Err((
+                                None,
+                                "Failed to create datagram multiplexer",
+                                ConnectionError::Io(e),
+                            ))
+                        }
                     }
                 };
 
@@ -573,7 +650,7 @@ impl Tunnel {
         };
 
         match pipe.exchange().await {
-            Ok(_) => {
+            Ok(()) => {
                 log_id!(trace, request_id, "Datagram multiplexer gracefully closed");
                 Ok(())
             }
@@ -583,5 +660,105 @@ impl Tunnel {
                 ConnectionError::Io(e),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authentication::registry_based::Client;
+    use crate::connection_limiter::ConnectionLimiter;
+    use crate::direct_forwarder::DirectForwarder;
+    use crate::tls_demultiplexer::Protocol;
+    use crate::utils::check;
+    use async_trait::async_trait;
+
+    struct IdleDownstream;
+
+    #[async_trait]
+    impl Downstream for IdleDownstream {
+        async fn listen(
+            &mut self,
+        ) -> io::Result<Option<Box<dyn downstream::PendingMultiplexedRequest>>> {
+            futures::future::pending().await
+        }
+
+        async fn graceful_shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn protocol(&self) -> Protocol {
+            Protocol::Http2
+        }
+
+        fn tls_domain(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_listener_keeps_connection_slot_until_tunnel_drop() -> io::Result<()> {
+        let context = Arc::new(core::Context::test()?);
+        let limiter = Arc::new(ConnectionLimiter::new(
+            &[Client {
+                username: "user".into(),
+                password: "password".into(),
+                max_http2_conns: None,
+                max_http3_conns: None,
+            }],
+            Some(1),
+            None,
+        ));
+        let credentials = BASE64_ENGINE.encode("user:password");
+        let guard = limiter
+            .try_acquire(&credentials, Protocol::Http2)
+            .ok_or_else(|| io::Error::other("Initial tunnel slot was denied"))?;
+        let mut tunnel = Tunnel::new(
+            context.clone(),
+            Box::new(IdleDownstream),
+            Box::new(DirectForwarder::new(context)),
+            AuthenticationPolicy::Default,
+            Some(guard),
+            log_utils::IdChain::empty(),
+        );
+        {
+            let listener = tunnel.listen();
+            tokio::pin!(listener);
+            check(
+                futures::poll!(listener.as_mut()).is_pending(),
+                "Idle tunnel listener completed unexpectedly",
+            )?;
+            check(
+                limiter.try_acquire(&credentials, Protocol::Http2).is_none(),
+                "Listening tunnel released its connection slot",
+            )?;
+        }
+        check(
+            limiter.try_acquire(&credentials, Protocol::Http2).is_none(),
+            "Cancelling the listener released the tunnel's connection slot",
+        )?;
+        drop(tunnel);
+        check(
+            limiter.try_acquire(&credentials, Protocol::Http2).is_some(),
+            "Dropping the tunnel did not release its connection slot",
+        )
+    }
+
+    #[test]
+    fn username_decoding_preserves_empty_fields_colons_and_invalid_input() {
+        for (credentials, expected) in [
+            ("user:password", "user"),
+            ("user:password:with:colons", "user"),
+            (":password", ""),
+            ("user", "user"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                decode_username(&BASE64_ENGINE.encode(credentials)).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(decode_username("not base64"), None);
+        assert_eq!(decode_username(&BASE64_ENGINE.encode([0xff])), None);
     }
 }

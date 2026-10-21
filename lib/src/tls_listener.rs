@@ -12,15 +12,16 @@ use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::{LazyConfigAcceptor, StartHandshake};
 
-pub(crate) struct TlsListener {}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TlsListener {}
 
-pub(crate) struct TlsAcceptor {
+pub struct TlsAcceptor {
     inner: StartHandshake<PrebufferedTcpStream>,
     client_random: Option<Vec<u8>>,
 }
 
 impl TlsListener {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {}
     }
 
@@ -39,11 +40,11 @@ impl TlsListener {
     async fn read_client_random_and_wrap_stream(
         mut stream: TcpStream,
     ) -> io::Result<(PrebufferedTcpStream, Option<Vec<u8>>)> {
-        let mut client_random = None;
-        let mut prebuffer: Vec<u8> = Vec::new();
         const MAX_PREBUFFER_LEN: usize = 16 * 1024;
         const READ_CHUNK_LEN: usize = 1024;
 
+        let mut client_random = None;
+        let mut prebuffer: Vec<u8> = Vec::new();
         while prebuffer.len() < MAX_PREBUFFER_LEN {
             match Self::extract_client_random(&prebuffer) {
                 ClientRandomExtraction::Found(cr) => {
@@ -93,7 +94,7 @@ impl TlsListener {
             }
             Err(tls_parser::Err::Incomplete(_)) => ClientRandomExtraction::NeedMoreData,
             Err(e) => {
-                log::debug!("Failed to parse TLS plaintext: {:?}", e);
+                log::debug!("Failed to parse TLS plaintext: {e:?}");
                 ClientRandomExtraction::NotFound
             }
         }
@@ -106,7 +107,7 @@ enum ClientRandomExtraction {
     NotFound,
 }
 
-pub(crate) struct PrebufferedTcpStream {
+pub struct PrebufferedTcpStream {
     prebuffer: Vec<u8>,
     prebuffer_pos: usize,
     stream: TcpStream,
@@ -117,12 +118,12 @@ impl std::fmt::Debug for PrebufferedTcpStream {
         f.debug_struct("PrebufferedTcpStream")
             .field("prebuffer_len", &self.prebuffer.len())
             .field("prebuffer_pos", &self.prebuffer_pos)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl PrebufferedTcpStream {
-    fn new(prebuffer: Vec<u8>, stream: TcpStream) -> Self {
+    const fn new(prebuffer: Vec<u8>, stream: TcpStream) -> Self {
         Self {
             prebuffer,
             prebuffer_pos: 0,
@@ -184,8 +185,7 @@ impl TlsAcceptor {
         self.inner
             .client_hello()
             .alpn()
-            .map(|x| x.map(Vec::from).collect())
-            .unwrap_or_default()
+            .map_or_else(Vec::new, |x| x.map(Vec::from).collect())
     }
 
     pub fn client_random(&self) -> Option<Vec<u8>> {
@@ -209,11 +209,11 @@ impl TlsAcceptor {
             ];
             let mut cfg = ServerConfig::builder_with_provider(Arc::new(provider))
                 .with_safe_default_protocol_versions()
-                .map_err(|e| io::Error::other(format!("TLS config error: {}", e)))?
+                .map_err(|e| io::Error::other(format!("TLS config error: {e}")))?
                 .with_no_client_auth()
                 .with_single_cert(cert_chain, key)
                 .map_err(|e| {
-                    io::Error::other(format!("Failed to create TLS configuration: {}", e))
+                    io::Error::other(format!("Failed to create TLS configuration: {e}"))
                 })?;
 
             cfg.alpn_protocols = vec![protocol.as_alpn().as_bytes().to_vec()];
@@ -221,5 +221,79 @@ impl TlsAcceptor {
         };
 
         self.inner.into_stream(tls_config).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn client_hello_record(random: &[u8; 32]) -> io::Result<Vec<u8>> {
+        let mut hello = vec![3, 3];
+        hello.extend_from_slice(random);
+        hello.extend_from_slice(&[0, 0, 2, 0x13, 1, 1, 0, 0, 0]);
+        let length = u16::try_from(hello.len()).map_err(io::Error::other)?;
+        let mut handshake = vec![1, 0];
+        handshake.extend_from_slice(&length.to_be_bytes());
+        handshake.extend_from_slice(&hello);
+        let length = u16::try_from(handshake.len()).map_err(io::Error::other)?;
+        let mut record = vec![22, 3, 3];
+        record.extend_from_slice(&length.to_be_bytes());
+        record.extend_from_slice(&handshake);
+        Ok(record)
+    }
+
+    #[test]
+    fn client_random_waits_for_a_complete_record() -> io::Result<()> {
+        let random = [0x42; 32];
+        let record = client_hello_record(&random)?;
+        for end in 0..record.len() {
+            if !matches!(
+                TlsListener::extract_client_random(&record[..end]),
+                ClientRandomExtraction::NeedMoreData
+            ) {
+                return Err(io::Error::other(format!(
+                    "Incomplete record accepted at byte {end}"
+                )));
+            }
+        }
+        let ClientRandomExtraction::Found(actual) = TlsListener::extract_client_random(&record)
+        else {
+            return Err(io::Error::other("Client random not found"));
+        };
+        if actual != random {
+            return Err(io::Error::other(format!(
+                "Client random changed: {actual:?} != {random:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prebuffer_is_drained_before_transport_bytes() -> io::Result<()> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let mut client = client?;
+        let (stream, _) = accepted?;
+        client.write_all(b"def").await?;
+        client.shutdown().await?;
+        let mut stream = PrebufferedTcpStream::new(b"abc".to_vec(), stream);
+        let mut first = [0; 2];
+        stream.read_exact(&mut first).await?;
+        if &first != b"ab" {
+            return Err(io::Error::other(format!(
+                "Incorrect prebuffer prefix: {first:?}"
+            )));
+        }
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await?;
+        if &rest != b"cdef" {
+            return Err(io::Error::other(format!(
+                "Incorrect remaining bytes: {rest:?}"
+            )));
+        }
+        Ok(())
     }
 }

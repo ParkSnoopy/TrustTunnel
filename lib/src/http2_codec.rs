@@ -10,11 +10,10 @@ use std::io;
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub(crate) struct Http2Codec<IO> {
+pub struct Http2Codec<IO> {
     state: State<IO>,
     parent_id_chain: log_utils::IdChain<u64>,
     next_conn_id: std::ops::RangeFrom<u64>,
@@ -32,7 +31,7 @@ struct Stream {
 }
 
 struct Request {
-    request: RequestHeaders,
+    headers: RequestHeaders,
     rx: RecvStream,
     client_address: IpAddr,
     id: log_utils::IdChain<u64>,
@@ -58,11 +57,15 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + net_utils::PeerAddr,
 {
     pub fn new(
-        core_settings: Arc<Settings>,
+        core_settings: &Settings,
         transport_stream: IO,
         parent_id_chain: log_utils::IdChain<u64>,
     ) -> io::Result<Self> {
-        let http2_settings = core_settings.listen_protocols.http2.as_ref().unwrap();
+        let http2_settings = core_settings
+            .listen_protocols
+            .http2
+            .as_ref()
+            .ok_or_else(|| io::Error::other("HTTP2 listening is not configured"))?;
 
         let client_address = transport_stream.peer_addr()?.ip();
 
@@ -93,7 +96,7 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> HttpCodec for Http2Codec<IO> {
         }
 
         let session = match &mut self.state {
-            State::Handshake(_) => unreachable!(),
+            State::Handshake(_) => return Err(io::Error::other("HTTP2 handshake is incomplete")),
             State::Established(s) => s,
         };
 
@@ -103,7 +106,9 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> HttpCodec for Http2Codec<IO> {
                 let (request, rx) = request.into_parts();
                 let id = self.parent_id_chain.extended(log_utils::IdItem::new(
                     log_utils::CONNECTION_ID_FMT,
-                    self.next_conn_id.next().unwrap(),
+                    self.next_conn_id
+                        .next()
+                        .ok_or_else(|| io::Error::other("HTTP2 connection IDs exhausted"))?,
                 ));
                 // @note: [`h2::StreamId`] cannot be converted to raw integer, so just log it
                 //        to have a link between stream and out own generated IDs in the logs
@@ -116,7 +121,7 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> HttpCodec for Http2Codec<IO> {
                 );
                 Ok(Some(Box::new(Stream {
                     request: Request {
-                        request,
+                        headers: request,
                         rx,
                         client_address: self.client_address,
                         id: id.clone(),
@@ -126,7 +131,9 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> HttpCodec for Http2Codec<IO> {
             }
             Some(Err(e)) if e.is_io() => {
                 log_id!(trace, self.parent_id_chain, "H2 stream accept IO error");
-                Err(e.into_io().unwrap())
+                Err(e
+                    .into_io()
+                    .ok_or_else(|| io::Error::other("Missing HTTP2 IO error"))?)
             }
             Some(Err(e)) if e.reason() == Some(Reason::NO_ERROR) => {
                 log_id!(
@@ -180,9 +187,11 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> HttpCodec for Http2Codec<IO> {
                 }
                 Some(Err(e)) if e.is_io() => {
                     log_id!(trace, self.parent_id_chain, "H2 graceful shutdown IO error");
-                    break Err(e.into_io().unwrap());
+                    break Err(e
+                        .into_io()
+                        .ok_or_else(|| io::Error::other("Missing HTTP2 IO error"))?);
                 }
-                Some(_) => continue,
+                Some(_) => (),
             }
         }
     }
@@ -217,7 +226,7 @@ impl http_codec::PendingRequest for Request {
     }
 
     fn request(&self) -> &RequestHeaders {
-        &self.request
+        &self.headers
     }
 
     fn client_address(&self) -> io::Result<IpAddr> {
@@ -306,6 +315,8 @@ impl http_codec::RespondedStreamSink for RespondStream {
     }
 }
 
+/// A future waiting for the HTTP/2 stream's reserved send capacity.
+#[derive(Debug)]
 pub struct WaitWritable<'a> {
     stream: &'a mut SendStream<Bytes>,
 }
@@ -372,7 +383,7 @@ impl http_codec::DroppingSink for RespondStream {
         if self.tx.capacity() >= data.len() {
             self.tx
                 .send_data(data, false)
-                .map(|_| datagram_pipe::SendStatus::Sent)
+                .map(|()| datagram_pipe::SendStatus::Sent)
                 .map_err(h2_to_io_error)
         } else {
             Ok(datagram_pipe::SendStatus::Dropped)
@@ -387,5 +398,21 @@ fn h2_to_io_error(e: h2::Error) -> io::Error {
     }
 
     e.into_io()
-        .unwrap_or_else(|| io::Error::other(format!("HTTP2 error: {:?}", reason)))
+        .unwrap_or_else(|| io::Error::other(format!("HTTP2 error: {reason:?}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_conversion_preserves_eof_and_protocol_failure() {
+        assert_eq!(
+            h2_to_io_error(Reason::NO_ERROR.into()).kind(),
+            ErrorKind::UnexpectedEof
+        );
+        let error = h2_to_io_error(Reason::PROTOCOL_ERROR.into());
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert_eq!(error.to_string(), "HTTP2 error: Some(PROTOCOL_ERROR)");
+    }
 }

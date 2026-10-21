@@ -8,29 +8,29 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 #[derive(Debug, Hash, Eq, PartialEq, Copy, Clone)]
-pub(crate) struct UdpDatagramMeta {
+pub struct UdpDatagramMeta {
     pub source: SocketAddr,
     pub destination: SocketAddr,
 }
 
-pub(crate) struct UdpDatagram {
+pub struct UdpDatagram {
     pub meta: UdpDatagramMeta,
     pub payload: Bytes,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Copy, Clone)]
-pub(crate) struct IcmpDatagramMeta {
+pub struct IcmpDatagramMeta {
     pub peer: IpAddr,
 }
 
 #[derive(Debug)]
-pub(crate) struct IcmpDatagram {
+pub struct IcmpDatagram {
     pub meta: IcmpDatagramMeta,
     pub message: icmp_utils::Message,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TcpConnectionMeta {
+pub struct TcpConnectionMeta {
     /// Address of a VPN client made the connection request
     pub client_address: IpAddr,
     /// Destination address of the connection
@@ -45,7 +45,7 @@ pub(crate) struct TcpConnectionMeta {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct UdpMultiplexerMeta {
+pub struct UdpMultiplexerMeta {
     /// An address of the VPN client establishing the UDP tunnel
     pub client_address: IpAddr,
     /// Authentication request source
@@ -58,7 +58,7 @@ pub(crate) struct UdpMultiplexerMeta {
 
 /// An abstract interface for a TCP connector implementation
 #[async_trait]
-pub(crate) trait TcpConnector: Send {
+pub trait TcpConnector: Send {
     /// Establish TCP connection to the peer
     async fn connect(
         self: Box<Self>,
@@ -69,7 +69,7 @@ pub(crate) trait TcpConnector: Send {
 
 /// An abstract interface for a datagram multiplexer authenticator
 #[async_trait]
-pub(crate) trait DatagramMultiplexerAuthenticator: Send {
+pub trait DatagramMultiplexerAuthenticator: Send {
     /// Perform an authentication procedure
     async fn check_auth(
         self: Box<Self>,
@@ -83,7 +83,7 @@ pub(crate) trait DatagramMultiplexerAuthenticator: Send {
 /// Encapsulates a shared state of the pipe's source and sink.
 /// The default implementation does nothing.
 #[async_trait]
-pub(crate) trait UdpDatagramPipeShared: Send + Sync {
+pub trait UdpDatagramPipeShared: Send + Sync {
     /// Notify the pipe of a new UDP "connection"
     ///
     /// `meta` is forward-oriented (`source` = the client, `destination` = the
@@ -101,28 +101,28 @@ pub(crate) trait UdpDatagramPipeShared: Send + Sync {
     fn on_connection_closed(&self, meta: &UdpDatagramMeta);
 }
 
-/// The status of successful [`DatagramSource.read`]
+/// The status of a successful datagram source read.
 #[derive(Debug)]
-pub(crate) enum UdpDatagramReadStatus {
+pub enum UdpDatagramReadStatus {
     /// The datagram received from a peer
     Read(UdpDatagram),
     /// UDP "connection" closed for some reason
     UdpClose(UdpDatagramMeta, io::Error),
 }
 
-pub(crate) type UdpMultiplexer = (
+pub type UdpMultiplexer = (
     Arc<dyn UdpDatagramPipeShared>,
     Box<dyn datagram_pipe::Source<Output = UdpDatagramReadStatus>>,
     Box<dyn datagram_pipe::Sink<Input = downstream::UdpDatagram>>,
 );
 
-pub(crate) type IcmpMultiplexer = (
+pub type IcmpMultiplexer = (
     Box<dyn datagram_pipe::Source<Output = IcmpDatagram>>,
     Box<dyn datagram_pipe::Sink<Input = downstream::IcmpDatagram>>,
 );
 
 /// An abstract interface for a traffic forwarder implementation
-pub(crate) trait Forwarder: Send {
+pub trait Forwarder: Send {
     /// Create a TCP connector object
     fn tcp_connector(&self) -> Box<dyn TcpConnector>;
 
@@ -144,7 +144,7 @@ pub(crate) trait Forwarder: Send {
 }
 
 impl UdpDatagramMeta {
-    pub fn reversed(&self) -> Self {
+    pub const fn reversed(&self) -> Self {
         Self {
             source: self.destination,
             destination: self.source,

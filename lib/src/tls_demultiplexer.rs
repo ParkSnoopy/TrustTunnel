@@ -14,14 +14,14 @@ use std::sync::Arc;
 const DEFAULT_PROTOCOL: Protocol = Protocol::Http1;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Protocol {
+pub enum Protocol {
     Http1,
     Http2,
     Http3,
 }
 
 #[derive(Clone)]
-pub(crate) struct BoringIdentity {
+pub struct BoringIdentity {
     pub chain: Arc<Vec<X509>>,
     pub key: Arc<PKey<Private>>,
 }
@@ -39,7 +39,7 @@ struct Host {
     boring: BoringIdentity,
 }
 
-pub(crate) struct ConnectionMeta {
+pub struct ConnectionMeta {
     /// The server name a client sent in the client hello
     pub sni: String,
     /// The protocol selected by the demultiplexer
@@ -98,7 +98,7 @@ impl Debug for ConnectionMeta {
     }
 }
 
-pub(crate) struct TlsDemux {
+pub struct TlsDemux {
     main_hosts: HashMap<String, Host>,
     reverse_proxy_hosts: HashMap<String, Host>,
     ping_hosts: HashMap<String, Host>,
@@ -108,7 +108,7 @@ pub(crate) struct TlsDemux {
 }
 
 impl Protocol {
-    pub fn as_alpn(&self) -> &'static str {
+    pub const fn as_alpn(self) -> &'static str {
         match self {
             Self::Http1 => net_utils::HTTP1_ALPN,
             Self::Http2 => net_utils::HTTP2_ALPN,
@@ -118,16 +118,16 @@ impl Protocol {
 
     fn from_alpn(alpn: &str) -> Option<Self> {
         match alpn {
-            net_utils::HTTP1_ALPN => Some(Protocol::Http1),
-            net_utils::HTTP2_ALPN => Some(Protocol::Http2),
-            net_utils::HTTP3_ALPN => Some(Protocol::Http3),
+            net_utils::HTTP1_ALPN => Some(Self::Http1),
+            net_utils::HTTP2_ALPN => Some(Self::Http2),
+            net_utils::HTTP3_ALPN => Some(Self::Http3),
             _ => None,
         }
     }
 }
 
 impl Protocol {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Http1 => "HTTP1",
             Self::Http2 => "HTTP2",
@@ -139,60 +139,8 @@ impl Protocol {
 impl TlsDemux {
     pub fn new(settings: &Settings, tls_settings: &settings::TlsHostsSettings) -> io::Result<Self> {
         // false-positive
-        #[allow(unused_variables)]
         let make_entry = |x: &settings::TlsHostInfo| -> io::Result<(String, Host)> {
-            let cert_chain = if cfg!(test) {
-                Default::default()
-            } else {
-                utils::load_certs(&x.cert_chain_path)?
-            };
-
-            let key = if cfg!(test) {
-                PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(vec![]))
-            } else {
-                utils::load_private_key(&x.private_key_path)?
-            };
-
-            let boring = if cfg!(test) {
-                // Create dummy BoringIdentity for tests
-                let rsa = Rsa::generate(2048).unwrap();
-                let pkey = PKey::from_rsa(rsa).unwrap();
-                BoringIdentity {
-                    chain: Arc::new(Vec::new()),
-                    key: Arc::new(pkey),
-                }
-            } else {
-                let mut chain = Vec::with_capacity(cert_chain.len());
-                for c in &cert_chain {
-                    chain.push(
-                        X509::from_der(c.as_ref())
-                            .map_err(|e| io::Error::other(format!("X509 parse error: {e}")))?,
-                    );
-                }
-
-                let key_bytes = key.secret_der();
-                let boring_key: PKey<Private> = PKey::private_key_from_der(key_bytes)
-                    .or_else(|_| PKey::private_key_from_pkcs8(key_bytes))
-                    .or_else(|_| PKey::private_key_from_pem(key_bytes))
-                    .map_err(|e| io::Error::other(format!("PKey parse error: {e}")))?;
-
-                BoringIdentity {
-                    chain: Arc::new(chain),
-                    key: Arc::new(boring_key),
-                }
-            };
-
-            Ok((
-                x.hostname.clone(),
-                Host {
-                    cert_chain,
-                    key,
-                    cert_chain_path: x.cert_chain_path.clone(),
-                    key_path: x.private_key_path.clone(),
-                    allowed_sni: x.allowed_sni.clone(),
-                    boring,
-                },
-            ))
+            Ok((x.hostname.clone(), Host::from_info(x)?))
         };
 
         macro_rules! make_hosts {
@@ -217,7 +165,7 @@ impl TlsDemux {
             ping_hosts: make_hosts!(tls_settings.ping_hosts)?,
             speedtest_hosts: make_hosts!(tls_settings.speedtest_hosts)?,
             reverse_proxy_hosts: match settings.reverse_proxy {
-                None => Default::default(),
+                None => HashMap::new(),
                 Some(_) => make_hosts!(tls_settings.reverse_proxy_hosts)?,
             },
             tunnel_protocols: {
@@ -236,27 +184,87 @@ impl TlsDemux {
             allowed_sni_to_main_host,
         })
     }
+}
 
+impl Host {
+    fn from_info(x: &settings::TlsHostInfo) -> io::Result<Self> {
+        let cert_chain = if cfg!(test) {
+            Vec::new()
+        } else {
+            utils::load_certs(&x.cert_chain_path)?
+        };
+
+        let key = if cfg!(test) {
+            PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(vec![]))
+        } else {
+            utils::load_private_key(&x.private_key_path)?
+        };
+
+        let boring = if cfg!(test) {
+            // Create dummy BoringIdentity for tests
+            let rsa = Rsa::generate(2048)?;
+            let pkey = PKey::from_rsa(rsa)?;
+            BoringIdentity {
+                chain: Arc::new(Vec::new()),
+                key: Arc::new(pkey),
+            }
+        } else {
+            let mut chain = Vec::with_capacity(cert_chain.len());
+            for c in &cert_chain {
+                chain.push(
+                    X509::from_der(c.as_ref())
+                        .map_err(|e| io::Error::other(format!("X509 parse error: {e}")))?,
+                );
+            }
+
+            let key_bytes = key.secret_der();
+            let boring_key: PKey<Private> = PKey::private_key_from_der(key_bytes)
+                .or_else(|_| PKey::private_key_from_pkcs8(key_bytes))
+                .or_else(|_| PKey::private_key_from_pem(key_bytes))
+                .map_err(|e| io::Error::other(format!("PKey parse error: {e}")))?;
+
+            BoringIdentity {
+                chain: Arc::new(chain),
+                key: Arc::new(boring_key),
+            }
+        };
+
+        Ok(Self {
+            cert_chain,
+            key,
+            cert_chain_path: x.cert_chain_path.clone(),
+            key_path: x.private_key_path.clone(),
+            allowed_sni: x.allowed_sni.clone(),
+            boring,
+        })
+    }
+}
+
+impl TlsDemux {
     /// There is no API method to get SNI from the client hello before accepting
     /// the connection. So try accepting it with the first certificate and change
     /// the server certificate afterwards if needed.
-    pub(crate) fn get_quic_connection_bootstrap_meta(&self) -> ConnectionMeta {
-        let (name, host) = self.main_hosts.iter().next().unwrap();
+    pub fn get_quic_connection_bootstrap_meta(&self) -> io::Result<ConnectionMeta> {
+        let (name, host) = self
+            .main_hosts
+            .iter()
+            .next()
+            .ok_or_else(|| io::Error::other("No main TLS host configured"))?;
 
-        ConnectionMeta {
+        Ok(ConnectionMeta {
             sni: name.clone(),
             protocol: Protocol::Http3,
             channel: Channel::Tunnel,
-            cert_chain: Default::default(), // quiche only accepts paths
+            cert_chain: Vec::new(), // quiche only accepts paths
             key: PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(vec![])), // quiche only accepts paths
             cert_chain_path: host.cert_chain_path.clone(),
             key_path: host.key_path.clone(),
             sni_auth_creds: None,
             boring: host.boring.clone(),
-        }
+        })
     }
 
-    pub(crate) fn select<'a, I>(&self, alpn: I, sni: String) -> Result<ConnectionMeta, String>
+    pub fn select<'a, I>(&self, alpn: I, sni: String) -> Result<ConnectionMeta, String>
     where
         I: Iterator<Item = &'a [u8]> + Clone,
     {
@@ -285,7 +293,7 @@ impl TlsDemux {
                 .iter()
                 .filter(|x| matches!(x, Protocol::Http1 | Protocol::Http3))
                 .max()
-                .cloned()
+                .copied()
             {
                 Some(x) => (x, Channel::ReverseProxy, h, None),
                 None if alpn.clone().peekable().peek().is_none() => {
@@ -303,7 +311,7 @@ impl TlsDemux {
                 parsed_alpn
                     .iter()
                     .max()
-                    .cloned()
+                    .copied()
                     .unwrap_or(DEFAULT_PROTOCOL),
                 Channel::Ping,
                 h,
@@ -314,7 +322,7 @@ impl TlsDemux {
                 parsed_alpn
                     .iter()
                     .max()
-                    .cloned()
+                    .copied()
                     .unwrap_or(DEFAULT_PROTOCOL),
                 Channel::Speedtest,
                 h,
@@ -331,7 +339,10 @@ impl TlsDemux {
                 Some(String::from(auth_creds)),
             )
         } else if let Some(main_hostname) = self.allowed_sni_to_main_host.get(&sni) {
-            let host = self.main_hosts.get(main_hostname).unwrap();
+            let host = self
+                .main_hosts
+                .get(main_hostname)
+                .ok_or_else(|| format!("Missing main TLS host {main_hostname}"))?;
             (
                 self.select_tunnel_channel_protocol(parsed_alpn.iter(), alpn)?,
                 Channel::Tunnel,
@@ -339,7 +350,7 @@ impl TlsDemux {
                 None,
             )
         } else {
-            return Err(format!("Unexpected SNI {}", sni));
+            return Err(format!("Unexpected SNI {sni}"));
         };
 
         Ok(ConnectionMeta {
@@ -367,7 +378,7 @@ impl TlsDemux {
         match parsed_advertised_alpn
             .filter(|x| self.tunnel_protocols.contains(x))
             .max()
-            .cloned()
+            .copied()
         {
             Some(x) => Ok(x),
             None if self.tunnel_protocols.contains(&DEFAULT_PROTOCOL)
@@ -392,14 +403,14 @@ mod tests {
     };
     use crate::tls_demultiplexer;
     use crate::tls_demultiplexer::{ConnectionMeta, Protocol};
-    use std::net::ToSocketAddrs;
+    use std::net::{Ipv4Addr, SocketAddr};
     use tls_demultiplexer::TlsDemux;
 
     fn dummy_reverse_proxy_settings() -> ReverseProxySettings {
         ReverseProxySettings {
-            server_address: "0.0.0.0:0".to_socket_addrs().unwrap().next().unwrap(),
-            path_mask: Default::default(),
-            h3_backward_compatibility: Default::default(),
+            server_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            path_mask: String::new(),
+            h3_backward_compatibility: false,
         }
     }
 
@@ -422,7 +433,7 @@ mod tests {
 
     fn check_protocol_selection(
         listen_protocols: ListenProtocolSettings,
-        advertised_protocols: Vec<Protocol>,
+        advertised_protocols: &[Protocol],
     ) -> Result<ConnectionMeta, String> {
         const TEST_HOST: &str = "httpbin.agrd.dev";
 
@@ -432,10 +443,11 @@ mod tests {
         let mut tls_settings = TlsHostsSettings::default();
         tls_settings.main_hosts = vec![make_tls_host(TEST_HOST.to_string())];
 
-        let demux = TlsDemux::new(&settings, &tls_settings).unwrap();
+        let demux = TlsDemux::new(&settings, &tls_settings).map_err(|e| e.to_string())?;
         demux.select(
             advertised_protocols
                 .iter()
+                .copied()
                 .map(Protocol::as_alpn)
                 .map(str::as_bytes),
             TEST_HOST.to_string(),
@@ -451,11 +463,11 @@ mod tests {
 
         let test_samples = vec![
             Sample {
-                listen_protocols: Default::default(),
+                listen_protocols: ListenProtocolSettings::default(),
                 advertised_protocols: vec![],
             },
             Sample {
-                listen_protocols: Default::default(),
+                listen_protocols: ListenProtocolSettings::default(),
                 advertised_protocols: vec![Protocol::Http1],
             },
             Sample {
@@ -483,22 +495,20 @@ mod tests {
         ];
 
         for sample in test_samples {
-            check_protocol_selection(
-                sample.listen_protocols.clone(),
-                sample.advertised_protocols.clone(),
-            )
-            .expect_err(&format!(
+            assert!(
+                check_protocol_selection(sample.listen_protocols, &sample.advertised_protocols)
+                    .is_err(),
                 "{:?}",
                 (
                     listen_protocol_settings_as_str(&sample.listen_protocols),
                     sample.advertised_protocols
                 )
-            ));
+            );
         }
     }
 
     #[test]
-    fn tunnel_protocol_selection() {
+    fn tunnel_protocol_selection() -> Result<(), Box<dyn std::error::Error>> {
         struct Sample {
             listen_protocols: ListenProtocolSettings,
             advertised_protocols: Vec<Protocol>,
@@ -527,25 +537,30 @@ mod tests {
         ];
 
         for sample in test_samples {
-            let meta = check_protocol_selection(
-                sample.listen_protocols.clone(),
-                sample.advertised_protocols.clone(),
-            )
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{:?}",
-                    (
-                        listen_protocol_settings_as_str(&sample.listen_protocols),
-                        sample.advertised_protocols
-                    )
+            let meta =
+                check_protocol_selection(sample.listen_protocols, &sample.advertised_protocols)
+                    .map_err(|e| {
+                        format!(
+                            "{e}: {:?}",
+                            (
+                                listen_protocol_settings_as_str(&sample.listen_protocols),
+                                sample.advertised_protocols
+                            )
+                        )
+                    })?;
+            if sample.expected_selection != meta.protocol {
+                return Err(format!(
+                    "Selected {:?}, expected {:?}",
+                    meta.protocol, sample.expected_selection
                 )
-            });
-            assert_eq!(sample.expected_selection, meta.protocol);
+                .into());
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn reverse_proxy_protocol_selection() {
+    fn reverse_proxy_protocol_selection() -> Result<(), Box<dyn std::error::Error>> {
         const TEST_HOST: &str = "httpbin.agrd.dev";
 
         let mut settings = Settings::default();
@@ -554,96 +569,102 @@ mod tests {
         let mut tls_settings = TlsHostsSettings::default();
         tls_settings.reverse_proxy_hosts = vec![make_tls_host(TEST_HOST.to_string())];
 
-        let demux = TlsDemux::new(&settings, &tls_settings).unwrap();
+        let demux = TlsDemux::new(&settings, &tls_settings)?;
 
-        let meta = demux
+        let meta = demux.select(
+            std::iter::once(Protocol::Http1.as_alpn().as_bytes()),
+            TEST_HOST.to_string(),
+        )?;
+        if meta.protocol != Protocol::Http1 {
+            return Err(format!("Selected {:?}, expected HTTP1", meta.protocol).into());
+        }
+        if demux
             .select(
-                [Protocol::Http1.as_alpn().as_bytes()].into_iter(),
+                std::iter::once(Protocol::Http2.as_alpn().as_bytes()),
                 TEST_HOST.to_string(),
             )
-            .unwrap();
-        assert_eq!(meta.protocol, Protocol::Http1);
-        demux
-            .select(
-                [Protocol::Http2.as_alpn().as_bytes()].into_iter(),
-                TEST_HOST.to_string(),
-            )
-            .unwrap_err();
-        let meta = demux
-            .select(
-                [Protocol::Http3.as_alpn().as_bytes()].into_iter(),
-                TEST_HOST.to_string(),
-            )
-            .unwrap();
-        assert_eq!(meta.protocol, Protocol::Http3);
+            .is_ok()
+        {
+            return Err("HTTP2 reverse proxy selection should fail".into());
+        }
+        let meta = demux.select(
+            std::iter::once(Protocol::Http3.as_alpn().as_bytes()),
+            TEST_HOST.to_string(),
+        )?;
+        if meta.protocol != Protocol::Http3 {
+            return Err(format!("Selected {:?}, expected HTTP3", meta.protocol).into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn ping_protocol_selection() {
+    fn ping_protocol_selection() -> Result<(), Box<dyn std::error::Error>> {
         const TEST_HOST: &str = "httpbin.agrd.dev";
 
         let mut tls_settings = TlsHostsSettings::default();
         tls_settings.ping_hosts = vec![make_tls_host(TEST_HOST.to_string())];
 
-        let demux = TlsDemux::new(&Settings::default(), &tls_settings).unwrap();
+        let demux = TlsDemux::new(&Settings::default(), &tls_settings)?;
 
-        let meta = demux
-            .select(
-                [Protocol::Http1.as_alpn().as_bytes()].into_iter(),
-                TEST_HOST.to_string(),
-            )
-            .unwrap();
-        assert_eq!(meta.protocol, Protocol::Http1);
-        let meta = demux
-            .select(
-                [Protocol::Http2.as_alpn().as_bytes()].into_iter(),
-                TEST_HOST.to_string(),
-            )
-            .unwrap();
-        assert_eq!(meta.protocol, Protocol::Http2);
-        let meta = demux
-            .select(
-                [Protocol::Http3.as_alpn().as_bytes()].into_iter(),
-                TEST_HOST.to_string(),
-            )
-            .unwrap();
-        assert_eq!(meta.protocol, Protocol::Http3);
+        let meta = demux.select(
+            std::iter::once(Protocol::Http1.as_alpn().as_bytes()),
+            TEST_HOST.to_string(),
+        )?;
+        if meta.protocol != Protocol::Http1 {
+            return Err(format!("Selected {:?}, expected HTTP1", meta.protocol).into());
+        }
+        let meta = demux.select(
+            std::iter::once(Protocol::Http2.as_alpn().as_bytes()),
+            TEST_HOST.to_string(),
+        )?;
+        if meta.protocol != Protocol::Http2 {
+            return Err(format!("Selected {:?}, expected HTTP2", meta.protocol).into());
+        }
+        let meta = demux.select(
+            std::iter::once(Protocol::Http3.as_alpn().as_bytes()),
+            TEST_HOST.to_string(),
+        )?;
+        if meta.protocol != Protocol::Http3 {
+            return Err(format!("Selected {:?}, expected HTTP3", meta.protocol).into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn speedtest_protocol_selection() {
+    fn speedtest_protocol_selection() -> Result<(), Box<dyn std::error::Error>> {
         const TEST_HOST: &str = "httpbin.agrd.dev";
 
         let mut tls_settings = TlsHostsSettings::default();
         tls_settings.speedtest_hosts = vec![make_tls_host(TEST_HOST.to_string())];
 
-        let demux = TlsDemux::new(&Settings::default(), &tls_settings).unwrap();
+        let demux = TlsDemux::new(&Settings::default(), &tls_settings)?;
 
-        let meta = demux
-            .select(
-                [Protocol::Http1.as_alpn().as_bytes()].into_iter(),
-                TEST_HOST.to_string(),
-            )
-            .unwrap();
-        assert_eq!(meta.protocol, Protocol::Http1);
-        let meta = demux
-            .select(
-                [Protocol::Http2.as_alpn().as_bytes()].into_iter(),
-                TEST_HOST.to_string(),
-            )
-            .unwrap();
-        assert_eq!(meta.protocol, Protocol::Http2);
-        let meta = demux
-            .select(
-                [Protocol::Http3.as_alpn().as_bytes()].into_iter(),
-                TEST_HOST.to_string(),
-            )
-            .unwrap();
-        assert_eq!(meta.protocol, Protocol::Http3);
+        let meta = demux.select(
+            std::iter::once(Protocol::Http1.as_alpn().as_bytes()),
+            TEST_HOST.to_string(),
+        )?;
+        if meta.protocol != Protocol::Http1 {
+            return Err(format!("Selected {:?}, expected HTTP1", meta.protocol).into());
+        }
+        let meta = demux.select(
+            std::iter::once(Protocol::Http2.as_alpn().as_bytes()),
+            TEST_HOST.to_string(),
+        )?;
+        if meta.protocol != Protocol::Http2 {
+            return Err(format!("Selected {:?}, expected HTTP2", meta.protocol).into());
+        }
+        let meta = demux.select(
+            std::iter::once(Protocol::Http3.as_alpn().as_bytes()),
+            TEST_HOST.to_string(),
+        )?;
+        if meta.protocol != Protocol::Http3 {
+            return Err(format!("Selected {:?}, expected HTTP3", meta.protocol).into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn channel_selection() {
+    fn channel_selection() -> Result<(), Box<dyn std::error::Error>> {
         struct Sample {
             sni: &'static str,
             expected_selection: Channel,
@@ -677,19 +698,24 @@ mod tests {
         tls_settings.speedtest_hosts = vec![make_tls_host("speedtest".to_string())];
         tls_settings.reverse_proxy_hosts = vec![make_tls_host("reverse.proxy".to_string())];
 
-        let demux = TlsDemux::new(&settings, &tls_settings).unwrap();
-        let advertised_alpn = [Protocol::Http1.as_alpn().as_bytes()].into_iter();
+        let demux = TlsDemux::new(&settings, &tls_settings)?;
+        let advertised_alpn = std::iter::once(Protocol::Http1.as_alpn().as_bytes());
 
         for sample in test_samples {
-            let meta = demux
-                .select(advertised_alpn.clone(), sample.sni.to_string())
-                .unwrap();
-            assert_eq!(meta.channel, sample.expected_selection);
+            let meta = demux.select(advertised_alpn.clone(), sample.sni.to_string())?;
+            if meta.channel != sample.expected_selection {
+                return Err(format!(
+                    "Selected {:?}, expected {:?}",
+                    meta.channel, sample.expected_selection
+                )
+                .into());
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn sni_authentication() {
+    fn sni_authentication() -> Result<(), Box<dyn std::error::Error>> {
         const TUNNEL_HOST: &str = "endpoint";
         const CREDENTIALS: &str = "creds";
 
@@ -703,30 +729,32 @@ mod tests {
         tls_settings.reverse_proxy_hosts =
             vec![make_tls_host(format!("reverse.proxy.{TUNNEL_HOST}"))];
 
-        let demux = TlsDemux::new(&settings, &tls_settings).unwrap();
-        let advertised_alpn = [Protocol::Http1.as_alpn().as_bytes()].into_iter();
-        let meta = demux
-            .select(
-                advertised_alpn.clone(),
-                format!("{CREDENTIALS}.{TUNNEL_HOST}"),
-            )
-            .unwrap();
-        assert_eq!(meta.channel, Channel::Tunnel);
-        assert_eq!(meta.sni_auth_creds.as_deref(), Some(CREDENTIALS));
+        let demux = TlsDemux::new(&settings, &tls_settings)?;
+        let advertised_alpn = std::iter::once(Protocol::Http1.as_alpn().as_bytes());
+        let meta = demux.select(
+            advertised_alpn.clone(),
+            format!("{CREDENTIALS}.{TUNNEL_HOST}"),
+        )?;
+        if meta.channel != Channel::Tunnel {
+            return Err(format!("Selected {:?}, expected Tunnel", meta.channel).into());
+        }
+        if meta.sni_auth_creds.as_deref() != Some(CREDENTIALS) {
+            return Err("SNI credentials changed".into());
+        }
+        Ok(())
     }
 
     #[test]
-    fn reverse_proxy_set_up_without_hosts() {
+    fn reverse_proxy_set_up_without_hosts() -> Result<(), Box<dyn std::error::Error>> {
         let mut settings = Settings::default();
         settings.reverse_proxy = Some(dummy_reverse_proxy_settings());
 
-        TlsDemux::new(&settings, &TlsHostsSettings::default())
-            .map(|_| ())
-            .unwrap();
+        TlsDemux::new(&settings, &TlsHostsSettings::default()).map(|_| ())?;
+        Ok(())
     }
 
     #[test]
-    fn alternative_sni_support() {
+    fn alternative_sni_support() -> Result<(), Box<dyn std::error::Error>> {
         const MAIN_HOST: &str = "example.org";
         const ALT_SNI_1: &str = "fake1.com";
         const ALT_SNI_2: &str = "fake2.net";
@@ -740,31 +768,45 @@ mod tests {
             ..Default::default()
         }];
 
-        let demux = TlsDemux::new(&settings, &tls_settings).unwrap();
-        let advertised_alpn = [Protocol::Http1.as_alpn().as_bytes()].into_iter();
+        let demux = TlsDemux::new(&settings, &tls_settings)?;
+        let advertised_alpn = std::iter::once(Protocol::Http1.as_alpn().as_bytes());
 
-        let meta = demux
-            .select(advertised_alpn.clone(), MAIN_HOST.to_string())
-            .unwrap();
-        assert_eq!(meta.channel, Channel::Tunnel);
-        assert_eq!(meta.sni, MAIN_HOST);
+        let meta = demux.select(advertised_alpn.clone(), MAIN_HOST.to_string())?;
+        if meta.channel != Channel::Tunnel {
+            return Err(format!("Selected {:?}, expected Tunnel", meta.channel).into());
+        }
+        if meta.sni != MAIN_HOST {
+            return Err(format!("SNI changed: {} != {MAIN_HOST}", meta.sni).into());
+        }
 
-        let meta = demux
-            .select(advertised_alpn.clone(), ALT_SNI_1.to_string())
-            .unwrap();
-        assert_eq!(meta.channel, Channel::Tunnel);
-        assert_eq!(meta.sni, ALT_SNI_1);
-        assert!(meta.sni_auth_creds.is_none());
+        let meta = demux.select(advertised_alpn.clone(), ALT_SNI_1.to_string())?;
+        if meta.channel != Channel::Tunnel {
+            return Err(format!("Selected {:?}, expected Tunnel", meta.channel).into());
+        }
+        if meta.sni != ALT_SNI_1 {
+            return Err(format!("SNI changed: {} != {ALT_SNI_1}", meta.sni).into());
+        }
+        if meta.sni_auth_creds.is_some() {
+            return Err("Alternative SNI unexpectedly authenticated".into());
+        }
 
-        let meta = demux
-            .select(advertised_alpn.clone(), ALT_SNI_2.to_string())
-            .unwrap();
-        assert_eq!(meta.channel, Channel::Tunnel);
-        assert_eq!(meta.sni, ALT_SNI_2);
-        assert!(meta.sni_auth_creds.is_none());
+        let meta = demux.select(advertised_alpn.clone(), ALT_SNI_2.to_string())?;
+        if meta.channel != Channel::Tunnel {
+            return Err(format!("Selected {:?}, expected Tunnel", meta.channel).into());
+        }
+        if meta.sni != ALT_SNI_2 {
+            return Err(format!("SNI changed: {} != {ALT_SNI_2}", meta.sni).into());
+        }
+        if meta.sni_auth_creds.is_some() {
+            return Err("Alternative SNI unexpectedly authenticated".into());
+        }
 
-        demux
-            .select(advertised_alpn.clone(), "unknown.sni".to_string())
-            .expect_err("Unknown SNI should fail");
+        if demux
+            .select(advertised_alpn, "unknown.sni".to_string())
+            .is_ok()
+        {
+            return Err("Unknown SNI should fail".into());
+        }
+        Ok(())
     }
 }

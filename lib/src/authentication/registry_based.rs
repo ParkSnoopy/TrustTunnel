@@ -22,6 +22,17 @@ pub struct Client {
     pub max_http3_conns: Option<u32>,
 }
 
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("username", &self.username)
+            .field("password", &"__stripped__")
+            .field("max_http2_conns", &self.max_http2_conns)
+            .field("max_http3_conns", &self.max_http3_conns)
+            .finish()
+    }
+}
+
 /// The [`Authenticator`] implementation which checks presence of a client in the list.
 /// Is only able to authenticate a client using the Proxy basic authorization.
 pub struct RegistryBasedAuthenticator {
@@ -29,7 +40,17 @@ pub struct RegistryBasedAuthenticator {
     clients: HashMap<String, String>,
 }
 
+impl std::fmt::Debug for RegistryBasedAuthenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryBasedAuthenticator")
+            .field("clients", &self.clients.len())
+            .finish()
+    }
+}
+
 impl RegistryBasedAuthenticator {
+    /// Build an authenticator from the configured client credentials.
+    #[must_use]
     pub fn new(clients: &[Client]) -> Self {
         Self {
             clients: clients
@@ -51,9 +72,8 @@ impl Authenticator for RegistryBasedAuthenticator {
         source: &authentication::Source<'_>,
         _log_id: &log_utils::IdChain<u64>,
     ) -> authentication::Status {
-        let creds = match &source {
-            authentication::Source::ProxyBasic(str) => str,
-            authentication::Source::Sni(str) => str,
+        let creds = match source {
+            authentication::Source::ProxyBasic(str) | authentication::Source::Sni(str) => str,
         };
         if self.clients.contains_key(creds.as_ref()) {
             authentication::Status::Pass
@@ -63,9 +83,8 @@ impl Authenticator for RegistryBasedAuthenticator {
     }
 
     fn username(&self, source: &authentication::Source<'_>) -> Option<String> {
-        let creds = match &source {
-            authentication::Source::ProxyBasic(str) => str,
-            authentication::Source::Sni(str) => str,
+        let creds = match source {
+            authentication::Source::ProxyBasic(str) | authentication::Source::Sni(str) => str,
         };
         self.clients.get(creds.as_ref()).cloned()
     }
@@ -87,11 +106,11 @@ mod tests {
     }
 
     fn creds(username: &str, password: &str) -> String {
-        BASE64_ENGINE.encode(format!("{}:{}", username, password))
+        BASE64_ENGINE.encode(format!("{username}:{password}"))
     }
 
     fn log_id() -> IdChain<u64> {
-        IdChain::from(IdItem::new("TEST={}", 0u64))
+        IdChain::from(IdItem::new("TEST={}", 0_u64))
     }
 
     #[test]
@@ -117,7 +136,18 @@ mod tests {
         let auth = RegistryBasedAuthenticator::new(&[make_client("alice", "secret")]);
         let ok = authentication::Source::ProxyBasic(creds("alice", "secret").into());
         let bad = authentication::Source::ProxyBasic(creds("alice", "wrong").into());
-        assert!(auth.authenticate(&ok, &log_id()) == Status::Pass);
-        assert!(auth.authenticate(&bad, &log_id()) == Status::Reject);
+        assert_eq!(auth.authenticate(&ok, &log_id()), Status::Pass);
+        assert_eq!(auth.authenticate(&bad, &log_id()), Status::Reject);
+    }
+
+    #[test]
+    fn debug_scrubs_client_credentials() {
+        let client = make_client("alice", "secret_password");
+        let client_debug = format!("{client:?}");
+        let auth = RegistryBasedAuthenticator::new(&[client]);
+        let auth_debug = format!("{auth:?}");
+        assert!(!client_debug.contains("secret_password"));
+        assert!(!auth_debug.contains("secret_password"));
+        assert!(!auth_debug.contains(&creds("alice", "secret_password")));
     }
 }
