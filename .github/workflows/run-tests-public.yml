@@ -17,7 +17,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: Install Rust
-        run: rustup toolchain install 1.95 --profile minimal
+        run: rustup toolchain install stable --profile minimal
       - name: Run tests
         run: cargo test --workspace
 
@@ -28,6 +28,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: Install Rust
-        run: rustup toolchain install 1.95 --profile minimal
+        run: rustup toolchain install stable --profile minimal
       - name: Run tests
         run: cargo test --workspace

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM python:3.13-slim-bookworm AS build
 ARG ENDPOINT_DIR_NAME="TrustTunnel"
-ARG RUST_DEFAULT_VERSION="1.95"
+ARG RUST_DEFAULT_VERSION="stable"
 WORKDIR /home
 # Install needed packets
 RUN apt update && \
@@ -16,7 +16,7 @@ COPY endpoint/ ./endpoint
 COPY lib/ ./lib
 COPY macros/ ./macros
 COPY tools/ ./tools
-COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile ./
+COPY Cargo.toml Cargo.lock Makefile ./
 # Build
 RUN make endpoint/build
 RUN make endpoint/build-wizard

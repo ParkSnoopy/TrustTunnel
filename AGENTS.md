@@ -12,8 +12,7 @@ traffic.
 
 ## Technical Context
 
-- **Language/Version**: Rust 1.95 (edition 2021), pinned via
-  `rust-toolchain.toml`
+- **Language/Version**: Rust (edition 2021)
 - **Primary Dependencies**: tokio, rustls, quiche (QUIC/HTTP3), h2, boring
   (BoringSSL), hyper, clap, sentry, prometheus, rcgen, instant-acme
 - **Storage**: TOML configuration files on disk (`vpn.toml`, `hosts.toml`,
@@ -52,7 +51,6 @@ vpn-libs-endpoint/
 ├── docker-entrypoint.sh       # Container entrypoint script
 ├── Makefile                   # Development task runner
 ├── Cargo.toml                 # Workspace manifest
-├── rust-toolchain.toml        # Pinned Rust toolchain version
 ├── .markdownlint.json         # Markdownlint configuration
 ├── vpn.toml                   # Main endpoint settings (generated, gitignored)
 ├── hosts.toml                 # TLS host settings (generated, gitignored)
