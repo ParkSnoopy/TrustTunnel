@@ -24,3 +24,6 @@ optional = true
 [dev-dependencies]
 proptest = "1.0"
 rand = "0.10.0"
+
+[lints]
+workspace = true
